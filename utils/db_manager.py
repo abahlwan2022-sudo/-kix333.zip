@@ -792,4 +792,3 @@ def bulk_check_duplicates(products: list, catalog: str = "our") -> list:
         )
         results.append({**p, "duplicate_check": check})
     return results
-
