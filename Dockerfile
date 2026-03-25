@@ -12,8 +12,8 @@ RUN pip install --no-cache-dir --upgrade pip && \
 # نسخ باقي الملفات
 COPY . .
 
-# منفذ التشغيل
-EXPOSE $PORT
+# منفذ التشغيل - تم التعديل هنا ليكون رقماً ثابتاً
+EXPOSE 8501
 
 # أمر التشغيل — PORT يُعطيه Railway تلقائياً
 CMD streamlit run app.py \
