@@ -96,6 +96,8 @@ from utils.db_manager import (init_db, log_event, log_decision,
                                save_processed, get_processed, undo_processed,
                                get_processed_keys, migrate_db_v26)
 
+INTERNAL_STORE_PATH = os.path.join("data", "mahwous_catalog.csv")
+
 # ── إعداد الصفحة ──────────────────────────
 logger = logging.getLogger(__name__)
 st.set_option("client.showErrorDetails", False)
@@ -127,6 +129,8 @@ _defaults = {
     "chat_history": [], "job_id": None, "job_running": False,
     "decisions_pending": {},   # {product_name: action}
     "our_df": None, "comp_dfs": None,  # حفظ الملفات للمنتجات المفقودة
+    "store_df": None,  # نسخة داخلية من كتالوج متجر مهووس
+    "store_autoloaded": False,
     "hidden_products": set(),  # منتجات أُرسلت لـ Make أو أُزيلت
     "selected_products": {},   # {prefix: [list of row dicts]} — القرارات المجمعة بالـ Checkboxes
     "final_priced_df": None,   # نتيجة خط أنابيب التسعير (مطابقة + كاشط + مقترح سعر)
@@ -139,6 +143,32 @@ for k, v in _defaults.items():
 # تحميل المنتجات المخفية من قاعدة البيانات عند كل تشغيل
 _db_hidden = get_hidden_product_keys()
 st.session_state.hidden_products = st.session_state.hidden_products | _db_hidden
+
+
+def _autoload_internal_store_catalog(show_message: bool = False) -> None:
+    """تحميل كتالوج متجر مهووس الداخلي تلقائياً وربطه بـ our_df/store_df."""
+    _store_df = st.session_state.get("store_df")
+    _our_df = st.session_state.get("our_df")
+    if isinstance(_store_df, pd.DataFrame) and not _store_df.empty:
+        if not (isinstance(_our_df, pd.DataFrame) and not _our_df.empty):
+            st.session_state.our_df = _store_df
+        if show_message and st.session_state.get("store_autoloaded", False):
+            st.success("✅ تم تحميل ملف متجر مهووس الأساسي تلقائياً من النظام.")
+        return
+    if isinstance(_our_df, pd.DataFrame) and not _our_df.empty:
+        st.session_state.store_df = _our_df
+        return
+    if os.path.exists(INTERNAL_STORE_PATH):
+        try:
+            _loaded = pd.read_csv(INTERNAL_STORE_PATH)
+            if isinstance(_loaded, pd.DataFrame) and not _loaded.empty:
+                st.session_state.store_df = _loaded
+                st.session_state.our_df = _loaded
+                st.session_state.store_autoloaded = True
+                if show_message:
+                    st.success("✅ تم تحميل ملف متجر مهووس الأساسي تلقائياً من النظام.")
+        except Exception as _e:
+            st.warning(f"تعذر تحميل ملف متجر مهووس الداخلي: {_e}")
 
 # ════════════════════════════════════════════════
 #  دوال المعالجة — يجب تعريفها قبل استخدامها
@@ -1450,6 +1480,33 @@ if page == "📊 لوحة التحكم":
 # ════════════════════════════════════════════════
 elif page == "🏢 كشط المنافسين":
     db_log("competitor_scrape", "view")
+    _autoload_internal_store_catalog(show_message=True)
+    our_df = getattr(st.session_state, "our_df", None)
+    has_store = isinstance(our_df, pd.DataFrame) and not our_df.empty
+    if has_store:
+        with st.expander("🛍️ جدول متجر مهووس (الأساس للمقارنة) - اضغط للتحقق", expanded=False):
+            st.info(
+                f"✅ تم تحميل {len(our_df)} منتج من متجر مهووس بنجاح. "
+                "ستتم مقارنة المسحوبات بهذا الجدول."
+            )
+            _preferred_cols = [
+                "أسم المنتج",
+                "اسم المنتج",
+                "سعر المنتج",
+                "السعر",
+                "رمز المنتج sku",
+                "رقم المنتج",
+                "sku",
+                "الماركة",
+                "brand",
+            ]
+            _show_cols = [c for c in _preferred_cols if c in our_df.columns]
+            if _show_cols:
+                # إزالة التكرار مع الحفاظ على ترتيب العرض
+                _show_cols = list(dict.fromkeys(_show_cols))
+                st.dataframe(our_df[_show_cols], use_container_width=True)
+            else:
+                st.dataframe(our_df, use_container_width=True)
     render_competitor_scrape_page()
 
 
@@ -1660,6 +1717,30 @@ elif page == "📊 لوحة التسعير":
 elif page == "📂 رفع الملفات":
     st.header("📂 رفع الملفات")
     db_log("upload", "view")
+    _autoload_internal_store_catalog(show_message=True)
+
+    with st.expander("⚙️ تحديث قاعدة بيانات متجر مهووس (للنظام الداخلي)", expanded=False):
+        st.caption("ارفع ملف CSV/Excel واحد ليتم حفظه داخلياً واستخدامه تلقائياً في كل تشغيل.")
+        internal_store_file = st.file_uploader(
+            "📦 تحديث ملف متجر مهووس الداخلي",
+            type=["csv", "xlsx", "xls"],
+            key="internal_store_file",
+        )
+        if internal_store_file is not None:
+            try:
+                os.makedirs(os.path.dirname(INTERNAL_STORE_PATH), exist_ok=True)
+                _internal_df, _internal_err = read_file(internal_store_file)
+                if _internal_err:
+                    st.error(f"❌ فشل قراءة الملف الداخلي: {_internal_err}")
+                else:
+                    # نوحّد الحفظ بصيغة CSV حتى يبقى التحميل التلقائي ثابتاً مهما كان الملف المرفوع.
+                    _internal_df.to_csv(INTERNAL_STORE_PATH, index=False, encoding="utf-8-sig")
+                    st.session_state.store_df = _internal_df
+                    st.session_state.our_df = _internal_df
+                    st.session_state.store_autoloaded = True
+                    st.success("تم تحديث قاعدة بيانات متجر مهووس الداخلية بنجاح! سيتم استخدام هذا الملف تلقائياً من الآن فصاعداً.")
+            except Exception as _save_e:
+                st.error(f"❌ تعذر تحديث الملف الداخلي: {_save_e}")
 
     our_file   = st.file_uploader("📦 ملف منتجاتنا (CSV/Excel)",
                                    type=["csv","xlsx","xls"], key="our_file")
@@ -1775,15 +1856,23 @@ elif page == "📂 رفع الملفات":
                         None if _cidv == _NO_ID_LABEL else _cidv,
                     )
 
+    _store_df = st.session_state.get("store_df")
+    has_internal_store = isinstance(_store_df, pd.DataFrame) and not _store_df.empty
+
     if st.button("🚀 بدء التحليل", type="primary"):
-        if our_file and comp_files:
-            our_df, err = read_file(our_file)
-            if err:
-                st.error(f"❌ {err}")
+        if (our_file or has_internal_store) and comp_files:
+            if our_file:
+                our_df, err = read_file(our_file)
+                if err:
+                    st.error(f"❌ {err}")
+                    our_df = None
             else:
+                our_df, err = _store_df.copy(), None
+
+            if our_df is not None:
                 _omap = st.session_state.get("_colmap_our")
                 _cmap = st.session_state.get("_colmap_comp", {})
-                if _omap:
+                if _omap and our_file:
                     _on, _op, _oi = _omap
                     our_df = apply_column_mapping(our_df, _on, _op, _oi)
                 else:
@@ -1864,14 +1953,15 @@ elif page == "📂 رفع الملفات":
                         _r["missing"] = missing_df
                         st.session_state.results     = _r
                         st.session_state.analysis_df = df_all
-                        log_analysis(our_file.name, comp_names, len(our_df),
+                        _our_source_name = our_file.name if our_file else os.path.basename(INTERNAL_STORE_PATH)
+                        log_analysis(_our_source_name, comp_names, len(our_df),
                                      int((df_all.get("match_score", pd.Series(dtype=float)) > 0).sum()),
                                      len(missing_df))
                         prog.progress(1.0, "✅ اكتمل!")
                         st.balloons()
                         st.rerun()
         else:
-            st.warning("⚠️ ارفع ملف منتجاتنا وملف منافس واحد على الأقل")
+            st.warning("⚠️ ارفع ملف منافس واحد على الأقل، وتأكد من توفر ملف متجر مهووس (رفع يدوي أو داخلي تلقائي).")
 
 
 # ════════════════════════════════════════════════
