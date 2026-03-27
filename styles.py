@@ -1,3 +1,4 @@
+import html
 import streamlit as st
 
 def get_styles():
@@ -50,31 +51,83 @@ def stat_card(icon, label, val, color):
     </div>
     """
 
-def vs_card(our_name, our_price, comp_name, comp_price, diff, comp_src, pid_str, image_url=""):
-    color = "#00C853" if diff <= 0 else "#FF1744"
-    img_html = ""
-    if image_url and image_url not in ("", "None", "nan"):
-        img_html = f'<img src="{image_url}" style="width:52px;height:52px;object-fit:cover;border-radius:8px;border:1px solid #30363d;margin-left:10px;flex-shrink:0;" onerror="this.style.display=\'none\'">'
+def vs_card(our_name, our_price, comp_name, comp_price, diff_pct, diff_val,
+             our_image_url=None, comp_image_url=None, comp_src="", pid_str=""):
+    """بطاقة مقارنة بصرية مزدوجة (منتجنا vs المنافس) — ألوان متناسقة مع الوضع الداكن."""
+    on = html.escape(str(our_name))
+    cn = html.escape(str(comp_name))
+    cs = html.escape(str(comp_src or ""))
+    ps = html.escape(str(pid_str or ""))
+    dps = html.escape(str(diff_pct))
+
+    try:
+        dv = float(diff_val)
+    except (TypeError, ValueError):
+        dv = 0.0
+    # نفس منطق البطاقة السابقة: أخضر عندما لا يزيد سعرنا عن المنافس (الفرق ≤ 0)
+    accent = "#00C853" if dv <= 0 else "#FF1744"
+
+    def _img_block(url, placeholder):
+        u = (url or "").strip()
+        if u and u not in ("None", "nan"):
+            return (
+                f'<img src="{html.escape(u)}" '
+                'style="width:60px;height:60px;border-radius:8px;object-fit:cover;'
+                'border:1px solid #30363d;flex-shrink:0;" '
+                'onerror="this.style.display=\'none\'">'
+            )
+        return (
+            f'<div style="width:60px;height:60px;border-radius:8px;background:#21262d;'
+            f'color:#8b949e;font-size:0.65rem;display:flex;align-items:center;'
+            f'justify-content:center;text-align:center;padding:4px;">{placeholder}</div>'
+        )
+
+    our_img = _img_block(our_image_url, "بدون<br>صورة")
+    comp_img = _img_block(comp_image_url, "بدون<br>صورة")
+
+    pid_line = (
+        f'<div style="font-size:0.75rem;color:#8b949e;margin-top:4px;">معرّف: {ps}</div>'
+        if ps else ""
+    )
+    src_line = (
+        f'<div style="font-size:0.75rem;color:#8b949e;margin-top:4px;">{cs}</div>'
+        if cs else ""
+    )
+
     return f"""
-    <div class="vs-card">
-        <div style="display: flex; justify-content: space-between; align-items: center;">
-            <div style="flex: 1; display: flex; align-items: center; gap: 10px;">
-                {img_html}
-                <div>
-                    <div style="font-size: 0.9rem; color: #8b949e;">منتجنا ({pid_str})</div>
-                    <div style="font-size: 1.1rem; font-weight: bold;">{our_name}</div>
-                    <div style="font-size: 1.3rem; color: #58a6ff;">{our_price} ر.س</div>
+    <div class="vs-card" style="padding:12px;margin-bottom:10px;">
+        <div style="display:flex;justify-content:space-between;align-items:stretch;
+                    gap:8px;background:#161b22;border:1px solid #30363d;
+                    border-radius:8px;padding:10px;">
+            <div style="flex:1;text-align:right;padding-left:8px;min-width:0;">
+                <div style="display:flex;align-items:center;gap:10px;justify-content:flex-end;">
+                    <div style="min-width:0;">
+                        <strong style="color:#e6edf3;">متجرنا</strong>
+                        <span style="color:#c9d1d9;">{on}</span><br>
+                        <b style="color:#58a6ff;">{our_price} ر.س</b>
+                        {pid_line}
+                    </div>
+                    {our_img}
                 </div>
             </div>
-            <div style="padding: 0 20px; font-size: 1.5rem; color: #8b949e;">VS</div>
-            <div style="flex: 1; text-align: right;">
-                <div style="font-size: 0.9rem; color: #8b949e;">{comp_src}</div>
-                <div style="font-size: 1.1rem; font-weight: bold;">{comp_name}</div>
-                <div style="font-size: 1.3rem; color: {color};">{comp_price} ر.س</div>
+            <div style="padding:0 10px;text-align:center;border-left:1px solid #30363d;
+                        border-right:1px solid #30363d;display:flex;flex-direction:column;
+                        justify-content:center;min-width:72px;">
+                <strong style="color:{accent};font-size:15px;" dir="ltr">{dps}%</strong>
+                <span style="color:#8b949e;font-size:11px;">الفارق</span>
+                <span style="color:{accent};font-size:11px;margin-top:4px;" dir="ltr">{dv:.0f} ر.س</span>
             </div>
-        </div>
-        <div style="margin-top: 10px; text-align: center; font-weight: bold; color: {color};">
-            الفرق: {diff} ر.س
+            <div style="flex:1;text-align:left;padding-right:8px;min-width:0;">
+                <div style="display:flex;align-items:center;gap:10px;justify-content:flex-start;">
+                    {comp_img}
+                    <div style="min-width:0;">
+                        <strong style="color:#e6edf3;">المنافس</strong>
+                        <span style="color:#c9d1d9;">{cn}</span><br>
+                        <b style="color:{accent};">{comp_price} ر.س</b>
+                        {src_line}
+                    </div>
+                </div>
+            </div>
         </div>
     </div>
     """
@@ -87,6 +140,8 @@ def comp_strip(all_comps):
     return html
 
 def miss_card(name, price, brand, size, ptype, comp, suggested_price, note, variant_html, tester_badge, border_color, confidence_level, confidence_score, product_id):
+    _cl = str(confidence_level or "").lower()
+    _conf_ar = {"green": "ثقة قوية", "yellow": "ثقة متوسطة", "red": "مشكوك"}.get(_cl, str(confidence_level or "—"))
     return f"""
     <div class="miss-card" style="border-left-color: {border_color}">
         <div style="display: flex; justify-content: space-between;">
@@ -100,7 +155,7 @@ def miss_card(name, price, brand, size, ptype, comp, suggested_price, note, vari
             </div>
         </div>
         <div style="margin-top: 8px; font-size: 0.85rem; color: #8b949e;">
-            المنافس: {comp} | الثقة: {confidence_level} ({confidence_score}%)
+            المنافس: {comp} | درجة ثقة المطابقة: {_conf_ar} ({confidence_score}%)
         </div>
         {variant_html}
         {f'<div style="margin-top: 5px; color: #ffd600; font-style: italic;">{note}</div>' if note else ''}

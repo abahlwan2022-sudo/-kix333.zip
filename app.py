@@ -1,5 +1,5 @@
 """
-app.py - نظام التسعير الذكي مهووس v26.0
+app.py - نظام التسعير الذكي مهووس v26.1
 ✅ معالجة خلفية مع حفظ تلقائي
 ✅ جداول مقارنة بصرية في كل الأقسام
 ✅ أزرار AI + قرارات لكل منتج
@@ -15,6 +15,8 @@ app.py - نظام التسعير الذكي مهووس v26.0
 """
 import streamlit as st
 import pandas as pd
+import asyncio
+import os
 import threading
 import time
 import uuid
@@ -29,9 +31,12 @@ except ImportError:
         def add_script_run_ctx(t): return t
 
 from config import *
+import config as _config
+_config.refresh_gemini_keys()
 from styles import get_styles, stat_card, vs_card, comp_strip, miss_card, get_sidebar_toggle_js
 from engines.engine import (read_file, run_full_analysis, find_missing_products,
-                             extract_brand, extract_size, extract_type, is_sample)
+                             extract_brand, extract_size, extract_type, is_sample,
+                             guess_default_columns, apply_column_mapping)
 from engines.ai_engine import (call_ai, gemini_chat, chat_with_ai,
                                 verify_match, analyze_product,
                                 bulk_verify, suggest_price,
@@ -54,12 +59,16 @@ from utils.helpers import (apply_filters, get_filter_options, export_to_excel,
 from utils.make_helper import (send_price_updates, send_new_products,
                                 send_missing_products, send_single_product,
                                 verify_webhook_connection, export_to_make_format,
-                                send_batch_smart)
+                                send_batch_smart, build_pricing_sync_payload,
+                                bulk_sync_pricing_recommendations,
+                                is_pricing_webhook_configured)
+from utils.competitor_manager import render_competitor_management_ui
 from utils.db_manager import (init_db, log_event, log_decision,
                                log_analysis, get_events, get_decisions,
                                get_analysis_history, upsert_price_history,
                                get_price_history, get_price_changes,
                                save_job_progress, get_job_progress, get_last_job,
+                               clear_missing_from_last_job,
                                save_hidden_product, get_hidden_product_keys,
                                init_db_v26, upsert_our_catalog, upsert_comp_catalog,
                                save_processed, get_processed, undo_processed,
@@ -87,6 +96,7 @@ _defaults = {
     "our_df": None, "comp_dfs": None,  # حفظ الملفات للمنتجات المفقودة
     "hidden_products": set(),  # منتجات أُرسلت لـ Make أو أُزيلت
     "selected_products": {},   # {prefix: [list of row dicts]} — القرارات المجمعة بالـ Checkboxes
+    "final_priced_df": None,   # نتيجة خط أنابيب التسعير (مطابقة + كاشط + مقترح سعر)
 }
 for k, v in _defaults.items():
     if k not in st.session_state:
@@ -115,6 +125,17 @@ def _split_results(df):
     }
 
 
+def _match_score_col(df: pd.DataFrame) -> str | None:
+    """اسم عمود نسبة التطابق (إنجليزي حالياً أو عربي من جلسات/JSON قديمة)."""
+    if df is None or df.empty:
+        return None
+    if "match_score" in df.columns:
+        return "match_score"
+    if "نسبة_التطابق" in df.columns:
+        return "نسبة_التطابق"
+    return None
+
+
 def _safe_results_for_json(results_list):
     """تحويل النتائج لصيغة آمنة للحفظ في JSON/SQLite — يحول القوائم المتداخلة"""
     safe = []
@@ -134,6 +155,21 @@ def _safe_results_for_json(results_list):
                 row[k] = v
         safe.append(row)
     return safe
+
+
+def _first_display_image_url(img_result):
+    """يستخرج أول رابط صورة حقيقي من نتيجة fetch_product_images (ليست صفحة بحث)."""
+    if not img_result or not isinstance(img_result, dict):
+        return ""
+    for im in img_result.get("images") or []:
+        if not isinstance(im, dict):
+            continue
+        if im.get("is_search"):
+            continue
+        u = str(im.get("url") or "").strip()
+        if u.startswith("http") and any(ext in u.lower() for ext in (".jpg", ".png", ".webp", ".jpeg")):
+            return u
+    return ""
 
 
 def _restore_results_from_json(results_list):
@@ -156,18 +192,18 @@ def _restore_results_from_json(results_list):
 
 
 # ── تحميل تلقائي للنتائج المحفوظة عند فتح التطبيق ──
+# ملاحظة: لا تستخدم `if results:` لأن [] تُعتبر False وتمنع الاستعادة رغم أن الحفظ نجح
 if st.session_state.results is None and not st.session_state.job_running:
     _auto_job = get_last_job()
-    if _auto_job and _auto_job["status"] == "done" and _auto_job.get("results"):
+    if _auto_job and _auto_job["status"] == "done" and _auto_job.get("results") is not None:
         _auto_records = _restore_results_from_json(_auto_job["results"])
         _auto_df = pd.DataFrame(_auto_records)
-        if not _auto_df.empty:
-            _auto_miss = pd.DataFrame(_auto_job.get("missing", [])) if _auto_job.get("missing") else pd.DataFrame()
-            _auto_r = _split_results(_auto_df)
-            _auto_r["missing"] = _auto_miss
-            st.session_state.results     = _auto_r
-            st.session_state.analysis_df = _auto_df
-            st.session_state.job_id      = _auto_job.get("job_id")
+        _auto_miss = pd.DataFrame(_auto_job.get("missing", [])) if _auto_job.get("missing") else pd.DataFrame()
+        _auto_r = _split_results(_auto_df)
+        _auto_r["missing"] = _auto_miss
+        st.session_state.results     = _auto_r
+        st.session_state.analysis_df = _auto_df
+        st.session_state.job_id      = _auto_job.get("job_id")
 
 
 # ── دوال مساعدة ───────────────────────────
@@ -239,14 +275,14 @@ def _run_analysis_background(job_id, our_df, comp_dfs, our_file_name, comp_names
     # ── المرحلة 2: حفظ تاريخ الأسعار (لا يوقف المعالجة إذا فشل) ────
     try:
         for _, row in analysis_df.iterrows():
-            if safe_float(row.get("نسبة_التطابق", 0)) > 0:
+            if safe_float(row.get("match_score", 0)) > 0:
                 upsert_price_history(
                     str(row.get("المنتج",       "")),
                     str(row.get("المنافس",       "")),
                     safe_float(row.get("سعر_المنافس", 0)),
                     safe_float(row.get("السعر",       0)),
                     safe_float(row.get("الفرق",        0)),
-                    safe_float(row.get("نسبة_التطابق", 0)),
+                    safe_float(row.get("match_score", 0)),
                     str(row.get("القرار",         ""))
                 )
     except Exception:
@@ -274,7 +310,7 @@ def _run_analysis_background(job_id, our_df, comp_dfs, our_file_name, comp_names
         )
         log_analysis(
             our_file_name, comp_names, total,
-            int((analysis_df.get("نسبة_التطابق", pd.Series(dtype=float)) > 0).sum()),
+            int((analysis_df.get("match_score", pd.Series(dtype=float)) > 0).sum()),
             len(missing_df)
         )
     except Exception as e:
@@ -358,12 +394,17 @@ def render_pro_table(df, prefix, section_type="update", show_search=True):
             file_name=f"{prefix}_{datetime.now().strftime('%Y%m%d')}.csv",
             mime="text/csv", key=f"{prefix}_csv")
     with ac3:
-        _bulk_labels = {"raise": "🤖 تحليل ذكي — خفض (أول 20)",
-                        "lower": "🤖 تحليل ذكي — رفع (أول 20)",
-                        "review": "🤖 تحقق جماعي (أول 20)",
-                        "approved": "🤖 مراجعة (أول 20)"}
-        if st.button(_bulk_labels.get(prefix, "🤖 AI جماعي (أول 20)"), key=f"{prefix}_bulk"):
-            with st.spinner("🤖 AI يحلل البيانات..."):
+        _bulk_labels = {"raise": "🤖 تحليل ذكي — خفض (محدد أو 20)",
+                        "lower": "🤖 تحليل ذكي — رفع (محدد أو 20)",
+                        "review": "🤖 تحقق جماعي (محدد أو 20)",
+                        "approved": "🤖 مراجعة (محدد أو 20)"}
+        if st.button(_bulk_labels.get(prefix, "🤖 AI جماعي (محدد أو 20)"), key=f"{prefix}_bulk"):
+            _sel_rows = st.session_state.selected_products.get(prefix, [])
+            if _sel_rows:
+                _bulk_df = pd.DataFrame(_sel_rows)
+            else:
+                _bulk_df = filtered.head(20)
+            with st.spinner(f"🤖 AI يحلل {len(_bulk_df)} منتجاً..."):
                 _section_map = {"raise": "price_raise", "lower": "price_lower",
                                 "review": "review", "approved": "approved"}
                 items = [{
@@ -371,7 +412,7 @@ def render_pro_table(df, prefix, section_type="update", show_search=True):
                     "comp": str(r.get("منتج_المنافس", "")),
                     "our_price": safe_float(r.get("السعر", 0)),
                     "comp_price": safe_float(r.get("سعر_المنافس", 0))
-                } for _, r in filtered.head(20).iterrows()]
+                } for _, r in _bulk_df.iterrows()]
                 res = bulk_verify(items, _section_map.get(prefix, "general"))
                 st.markdown(f'<div class="ai-box">{res["response"]}</div>',
                             unsafe_allow_html=True)
@@ -479,7 +520,7 @@ def render_pro_table(df, prefix, section_type="update", show_search=True):
         our_price  = safe_float(row.get("السعر", 0))
         comp_price = safe_float(row.get("سعر_المنافس", 0))
         diff       = safe_float(row.get("الفرق", our_price - comp_price))
-        match_pct  = safe_float(row.get("نسبة_التطابق", 0))
+        match_pct  = safe_float(row.get("match_score", 0))
         comp_src   = str(row.get("المنافس", ""))
         brand      = str(row.get("الماركة", ""))
         size       = row.get("الحجم", "")
@@ -531,17 +572,35 @@ def render_pro_table(df, prefix, section_type="update", show_search=True):
         if _img_cache_key not in st.session_state:
             try:
                 _img_result = fetch_product_images(our_name, brand)
-                st.session_state[_img_cache_key] = (_img_result or {}).get("url", "")
+                st.session_state[_img_cache_key] = _first_display_image_url(_img_result)
             except Exception:
                 st.session_state[_img_cache_key] = ""
         _product_image_url = st.session_state.get(_img_cache_key, "")
 
+        _comp_img_key = f"img_comp_{comp_name}_{brand}_{comp_src}"
+        if _comp_img_key not in st.session_state:
+            try:
+                _cr = fetch_product_images(comp_name, brand)
+                st.session_state[_comp_img_key] = _first_display_image_url(_cr)
+            except Exception:
+                st.session_state[_comp_img_key] = ""
+        _comp_image_url = st.session_state.get(_comp_img_key, "")
+
+        if comp_price and comp_price > 0:
+            _diff_pct_val = (our_price - comp_price) / comp_price * 100.0
+        else:
+            _diff_pct_val = 0.0
+        _diff_pct_str = f"{_diff_pct_val:+.1f}"
+
         with _card_col:
-          # بطاقة VS مع رقم المنتج والصورة
-          st.markdown(vs_card(our_name, our_price, comp_name,
-                              comp_price, diff, comp_src, _pid_str,
-                              image_url=_product_image_url),
-                      unsafe_allow_html=True)
+          # بطاقة VS مع صورتين ونسبة الفارق السعري
+          st.markdown(vs_card(
+              our_name, our_price, comp_name, comp_price,
+              _diff_pct_str, diff,
+              our_image_url=_product_image_url,
+              comp_image_url=_comp_image_url,
+              comp_src=comp_src, pid_str=_pid_str,
+          ), unsafe_allow_html=True)
 
         # شريط المعلومات
         match_color = ("#00C853" if match_pct >= 90
@@ -807,7 +866,7 @@ with st.sidebar:
         ai_label = f"🤖 Gemini ✅ ({len(GEMINI_API_KEYS)} مفتاح)"
     else:
         ai_color = "#FF1744"
-        ai_label = "🔴 AI غير متصل — تحقق من Secrets"
+        ai_label = "🔴 AI غير متصل — أضف مفتاح Gemini"
 
     st.markdown(
         f'<div style="background:{ai_color}22;border:1px solid {ai_color};'
@@ -818,8 +877,15 @@ with st.sidebar:
 
     # زر تشخيص سريع
     if not ai_ok:
+        st.caption(
+            "ضع **`GEMINI_API_KEY`** في Railway Variables أو في `.streamlit/secrets.toml` محلياً. "
+            "يُقبل أيضاً **`GOOGLE_API_KEY`** كاسم بديل."
+        )
         if st.button("🔍 تشخيص المشكلة", key="diag_btn"):
             import os
+            st.write("**المتغيرات البيئية (أسماء فقط):**")
+            for nm in ("GEMINI_API_KEY", "GEMINI_API_KEYS", "GOOGLE_API_KEY", "GEMINI_KEY_1"):
+                st.write(f"  `{nm}`: {'موجود' if os.environ.get(nm) else '—'}")
             st.write("**الـ secrets المتاحة:**")
             try:
                 available = list(st.secrets.keys())
@@ -830,7 +896,7 @@ with st.sidebar:
             except Exception as e:
                 st.error(f"خطأ: {e}")
             # محاولة مباشرة
-            for key_name in ["GEMINI_API_KEYS","GEMINI_API_KEY","GEMINI_KEY_1"]:
+            for key_name in ["GEMINI_API_KEYS","GEMINI_API_KEY","GEMINI_KEY_1","GOOGLE_API_KEY"]:
                 try:
                     v = st.secrets[key_name]
                     st.success(f"✅ وجدت {key_name} = {str(v)[:20]}...")
@@ -853,9 +919,13 @@ with st.sidebar:
                     # fallback: rerun عادي إذا لم تكن المكتبة موجودة
                     time.sleep(4)
                     st.rerun()
-            elif job["status"] == "done" and st.session_state.job_running:
-                # اكتمل — حمّل النتائج تلقائياً مع استعادة القوائم
-                if job.get("results"):
+            elif job["status"] == "done":
+                # اكتمل — حمّل النتائج (يشمل [] إذا كان التحليل فارغاً) عند أول اكتمال أو إن لم تُحمَّل بعد
+                _should_load = (
+                    job.get("results") is not None
+                    and (st.session_state.job_running or st.session_state.results is None)
+                )
+                if _should_load:
                     _restored = _restore_results_from_json(job["results"])
                     df_all = pd.DataFrame(_restored)
                     missing_df = pd.DataFrame(job.get("missing", [])) if job.get("missing") else pd.DataFrame()
@@ -864,18 +934,31 @@ with st.sidebar:
                     st.session_state.results     = _r
                     st.session_state.analysis_df = df_all
                 st.session_state.job_running = False
-                st.balloons()
-                st.rerun()
+                if _should_load:
+                    st.balloons()
+                    st.rerun()
             elif job["status"].startswith("error"):
                 st.error(f"❌ فشل: {job['status'][7:80]}")
                 st.session_state.job_running = False
 
     page = st.radio("الأقسام", SECTIONS, label_visibility="collapsed")
 
+    st.markdown(
+        '<p style="font-size:0.85rem;margin:8px 0;line-height:1.4;">'
+        "🏢 <b>إدارة المنافسين (Sitemap):</b> افتح القسم <b>⚙️ الإعدادات</b> "
+        "← التبويب <b>🏢 المنافسين (Sitemap)</b> لإضافة حتى <b>7</b> روابط اختبار."
+        "</p>",
+        unsafe_allow_html=True,
+    )
+
     st.markdown("---")
     if st.session_state.results:
         r = st.session_state.results
         st.markdown("**📊 ملخص:**")
+        st.caption(
+            "🔍 **مفقود** = منتج يظهر عند المنافس وقد لا يكون في كتالوجنا — **ليس خطأ في البرنامج**. "
+            "الألوان أدناه = **مدى ثقة المحرك** في اقتراح المطابقة."
+        )
         for key, icon, label in [
             ("price_raise","🔴","أعلى"), ("price_lower","🟢","أقل"),
             ("approved","✅","موافق"), ("missing","🔍","مفقود"),
@@ -883,18 +966,32 @@ with st.sidebar:
         ]:
             cnt = len(r.get(key, pd.DataFrame()))
             st.caption(f"{icon} {label}: **{cnt}**")
-        # ملخص الثقة للمفقودات
+        if len(r.get("missing", pd.DataFrame())) > 0:
+            if st.button("🗑️ مسح المفقودات من الملخص (للتجربة)", key="btn_clear_missing_sidebar", use_container_width=True):
+                st.session_state.results["missing"] = pd.DataFrame()
+                clear_missing_from_last_job()
+                st.rerun()
+        # ملخص الثقة للمفقودات (ليست «أخطاء» — جودة اقتراح المطابقة)
         _miss_df = r.get("missing", pd.DataFrame())
         if not _miss_df.empty and "مستوى_الثقة" in _miss_df.columns:
             _gc = len(_miss_df[_miss_df["مستوى_الثقة"] == "green"])
             _yc = len(_miss_df[_miss_df["مستوى_الثقة"] == "yellow"])
             _rc = len(_miss_df[_miss_df["مستوى_الثقة"] == "red"])
+            st.caption("ثقة اقتراح المفقود:")
             st.markdown(
                 f'<div style="background:#1a1a2e;border-radius:6px;padding:6px;margin-top:4px;font-size:.75rem">'
-                f'🟢 مؤكد: <b>{_gc}</b> &nbsp; '
-                f'🟡 محتمل: <b>{_yc}</b> &nbsp; '
+                f'🟢 ثقة قوية: <b>{_gc}</b> &nbsp; '
+                f'🟡 ثقة متوسطة: <b>{_yc}</b> &nbsp; '
                 f'🔴 مشكوك: <b>{_rc}</b></div>',
                 unsafe_allow_html=True)
+        _priced = sum(len(r.get(k, pd.DataFrame())) for k in ("price_raise", "price_lower", "approved", "review"))
+        if _priced == 0 and not _miss_df.empty:
+            st.info(
+                "**لماذا المفقود فقط؟** قسم «مفقود» = منتجات **عند المنافس** قد لا تكون في كتالوجنا. "
+                "أقسام سعر أعلى/أقل/موافق = مقارنة **منتجاتنا** مع المنافس؛ إذا كانت كلها **0** فغالباً "
+                "لا تطابق كافٍ (أسماء مختلفة، ترميز CSV، أو أعمدة غير معروفة). "
+                "جرّب: حفظ CSV بـ **UTF-8**، وتأكد أن **حد الصفوف = 0** لمعالجة الملف كاملاً، ورفع ملفات متطابقة الأعمدة."
+            )
 
     # قرارات معلقة
     pending_cnt = len(st.session_state.decisions_pending)
@@ -903,6 +1000,92 @@ with st.sidebar:
                     f'border-radius:6px;padding:6px;text-align:center;color:#FF1744;'
                     f'font-size:.8rem">📦 {pending_cnt} قرار معلق</div>',
                     unsafe_allow_html=True)
+
+
+# ── توقيع الملف المرفوع + تعيين الأعمدة (قبل سلسلة if page) ──
+_NO_ID_LABEL = "— بدون معرّف —"
+_PEEK_ROWS = 400
+
+
+def _upload_file_sig(uf):
+    if uf is None:
+        return ""
+    try:
+        return f"{uf.name}_{len(uf.getvalue())}"
+    except Exception:
+        return str(getattr(uf, "name", "x"))
+
+
+def _col_select_index(cols, default):
+    if not cols:
+        return 0
+    if default and default in cols:
+        return cols.index(default)
+    return 0
+
+
+def display_pricing_insights(final_df: pd.DataFrame) -> None:
+    """
+    مقاييس لوحة الرؤى:
+    - إجمالي زيادة الربح المحتملة: مجموع (المقترح − الحالي) عندما المقترح أعلى.
+    - تنبيه المنافسة: عدد المنتجات الأغلى من سعر المنافس (مع سعر منافس صالح).
+    - منتجات رابحة: أسعارنا أقل من المنافس (أفضل سعر في السوق ضمن البيانات).
+    """
+    if final_df is None or final_df.empty:
+        st.warning("لا توجد بيانات لحساب المؤشرات.")
+        return
+    df = final_df.copy()
+    for c in ("price", "comp_price", "suggested_price"):
+        if c not in df.columns:
+            df[c] = 0.0
+        else:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+    valid_comp = df["comp_price"] > 0
+    over_priced = int((valid_comp & (df["price"] > df["comp_price"])).sum())
+    under_priced = int((valid_comp & (df["price"] < df["comp_price"])).sum())
+    profit_opt = float(
+        (df["suggested_price"] - df["price"]).where(df["suggested_price"] > df["price"], 0.0).sum()
+    )
+    col1, col2, col3 = st.columns(3)
+    col1.metric("منتجات أغلى من المنافس", over_priced, delta_color="inverse")
+    col2.metric("منتجات أرخص من المنافس", under_priced)
+    col3.metric("فرصة ربح إضافية (ريال)", f"{profit_opt:,.2f}")
+
+
+def render_smart_decision_table(df: pd.DataFrame) -> None:
+    """جدول قرار مع تلوين: أحمر إذا سعرنا أعلى من المنافس بأكثر من 10٪، أخضر إذا كنا الأرخص."""
+    if df is None or df.empty:
+        return
+    d = df.copy()
+    for c in ("price", "comp_price", "suggested_price"):
+        if c not in d.columns:
+            d[c] = 0.0
+        else:
+            d[c] = pd.to_numeric(d[c], errors="coerce").fillna(0.0)
+    d["Potential Profit Change"] = d["suggested_price"] - d["price"]
+    base_cols = ["name", "sku", "price", "comp_price", "suggested_price", "Potential Profit Change"]
+    show_cols = [c for c in base_cols if c in d.columns]
+    for c in ("match_score", "action_required", "comp_name"):
+        if c in d.columns and c not in show_cols:
+            show_cols.append(c)
+    show_df = d[show_cols].copy()
+
+    def _row_style(row: pd.Series):
+        p = float(row.get("price", 0) or 0)
+        c = float(row.get("comp_price", 0) or 0)
+        css = ""
+        if c > 0 and p > c * 1.10:
+            css = "background-color: #fecaca; color: #7f1d1d"
+        elif c > 0 and p < c:
+            css = "background-color: #bbf7d0; color: #14532d"
+        return [css] * len(row)
+
+    st.markdown("### 📋 جدول القرار الذكي")
+    st.dataframe(
+        show_df.style.apply(_row_style, axis=1),
+        use_container_width=True,
+        hide_index=True,
+    )
 
 
 # ════════════════════════════════════════════════
@@ -947,6 +1130,10 @@ if page == "📊 لوحة التحكم":
         ]
         for col, (icon, label, val, color) in zip(cols, data):
             col.markdown(stat_card(icon, label, val, color), unsafe_allow_html=True)
+        st.caption(
+            "**توضيح:** «مفقود» يعني منتجاً عند المنافس قد لا يكون لديكم في الملف — **وليس خطأ تشغيلاً**. "
+            "شريط الألوان التالي يوضّح **قوة ثقة المحرك** في اقتراح المطابقة لتلك المفقودات."
+        )
 
         # ملخص الثقة للمفقودات في لوحة التحكم
         _miss_dash = r.get("missing", pd.DataFrame())
@@ -957,8 +1144,8 @@ if page == "📊 لوحة التحكم":
             st.markdown(
                 f'<div style="display:flex;gap:12px;justify-content:center;padding:8px;'
                 f'background:#1a1a2e;border-radius:8px;margin:8px 0">'
-                f'<span style="color:#00C853">🟢 مؤكد: <b>{_g}</b></span>'
-                f'<span style="color:#FFD600">🟡 محتمل: <b>{_y}</b></span>'
+                f'<span style="color:#00C853">🟢 ثقة قوية: <b>{_g}</b></span>'
+                f'<span style="color:#FFD600">🟡 ثقة متوسطة: <b>{_y}</b></span>'
                 f'<span style="color:#FF1744">🔴 مشكوك: <b>{_rd}</b></span>'
                 f'</div>', unsafe_allow_html=True)
 
@@ -1003,20 +1190,149 @@ if page == "📊 لوحة التحكم":
     else:
         # استئناف آخر job؟
         last = get_last_job()
-        if last and last["status"] == "done" and last.get("results"):
+        if last and last["status"] == "done" and last.get("results") is not None:
             st.info(f"💾 يوجد تحليل محفوظ من {last.get('updated_at','')}")
             if st.button("🔄 استعادة النتائج المحفوظة"):
                 _restored_last = _restore_results_from_json(last["results"])
                 df_all = pd.DataFrame(_restored_last)
-                if not df_all.empty:
-                    missing_df = pd.DataFrame(last.get("missing", [])) if last.get("missing") else pd.DataFrame()
-                    _r = _split_results(df_all)
-                    _r["missing"] = missing_df
-                    st.session_state.results     = _r
-                    st.session_state.analysis_df = df_all
-                    st.rerun()
+                missing_df = pd.DataFrame(last.get("missing", [])) if last.get("missing") else pd.DataFrame()
+                _r = _split_results(df_all)
+                _r["missing"] = missing_df
+                st.session_state.results     = _r
+                st.session_state.analysis_df = df_all
+                st.rerun()
         else:
             st.info("👈 ارفع ملفاتك من قسم 'رفع الملفات'")
+
+
+# ════════════════════════════════════════════════
+#  1b. لوحة التسعير — رؤى قابلة للتنفيذ
+# ════════════════════════════════════════════════
+elif page == "📊 لوحة التسعير (Dashboard)":
+    st.header("📊 لوحة التسعير (Dashboard)")
+    st.caption("رؤى من بيانات التسعير المطابقة مع المنافس والسعر المقترح.")
+    db_log("pricing_dashboard", "view")
+
+    if "final_priced_df" not in st.session_state or st.session_state["final_priced_df"] is None:
+        st.info(
+            "لا توجد بيانات في **final_priced_df**. عيّن النتيجة بعد تشغيل خط أنابيب التسعير "
+            "(مثلاً: `run_full_pricing_pipeline` من `utils.pricing_pipeline`) وتخزينها في "
+            "`st.session_state['final_priced_df']`."
+        )
+    else:
+        df = st.session_state["final_priced_df"]
+        if not isinstance(df, pd.DataFrame):
+            st.error("final_priced_df يجب أن يكون DataFrame.")
+        elif df.empty:
+            st.warning("جدول التسعير فارغ.")
+        else:
+            st.markdown("### 📈 مؤشرات التسعير")
+            display_pricing_insights(df)
+
+            st.markdown("---")
+            render_smart_decision_table(df)
+
+            st.markdown("---")
+            st.markdown("### 🎯 توصيات سريعة")
+            action = st.radio(
+                "عرض المنتجات حسب التوصية:",
+                ["الكل", "تحتاج تخفيض (للمنافسة)", "يمكن رفع سعرها (لزيادة الربح)"],
+                horizontal=True,
+            )
+            work = df.copy()
+            for c in ("price", "comp_price", "suggested_price"):
+                if c not in work.columns:
+                    work[c] = 0.0
+                else:
+                    work[c] = pd.to_numeric(work[c], errors="coerce").fillna(0.0)
+            if action == "تحتاج تخفيض (للمنافسة)":
+                display_df = work[work["price"] > work["comp_price"]]
+            elif action == "يمكن رفع سعرها (لزيادة الربح)":
+                display_df = work[work["suggested_price"] > work["price"]]
+            else:
+                display_df = work
+
+            st.markdown("---")
+            st.markdown("### ⚡ مزامنة المتجر (Bulk Sync)")
+            st.caption(
+                "إرسال **السعر المقترح** إلى سلة عبر Make.com — طلب واحد لكل دفعة يحتوي مصفوفة `products` "
+                "(لتقليل الضغط على الحدود)."
+            )
+            if not is_pricing_webhook_configured():
+                st.warning(
+                    "لم يُعرّف **WEBHOOK_UPDATE_PRICES**. أضفه في متغيرات البيئة (مثل Railway) أو "
+                    "`.streamlit/secrets.toml` — نفس المفتاح الذي يستخدمه `utils.make_helper`."
+                )
+            col_sync_a, col_sync_b = st.columns(2)
+            with col_sync_a:
+                skip_sync_unchanged = st.checkbox(
+                    "تخطي المنتجات دون تغيّر فعلي في السعر",
+                    value=True,
+                    key="pricing_sync_skip_unchanged",
+                )
+            with col_sync_b:
+                use_safe_sync = st.checkbox(
+                    "شبكة أمان (حد نسبة تغيّر السعر قبل الإرسال)",
+                    value=True,
+                    key="pricing_sync_safe",
+                )
+            batch_sz = st.number_input(
+                "حجم الدفعة (عدد المنتجات في كل طلب JSON واحد)",
+                min_value=5,
+                max_value=200,
+                value=40,
+                step=5,
+                key="pricing_sync_batch",
+                help="إذا رفض Make الطلبات الكبيرة، قلّل القيمة.",
+            )
+
+            if display_df.empty:
+                st.caption("لا توجد منتجات في التصفية الحالية للمزامنة.")
+            elif "sku" not in display_df.columns:
+                st.warning("عمود **sku** مطلوب لربط المنتج بسلة عند الإرسال.")
+            else:
+                sku_opts = display_df["sku"].astype(str).unique().tolist()
+                pick_skus = st.multiselect(
+                    "اختر المنتجات المراد مزامنة أسعارها (السعر المرسل = المقترح):",
+                    options=sku_opts,
+                    default=sku_opts,
+                    key="pricing_sync_skus",
+                    format_func=lambda s: (
+                        f"{s} — {display_df.loc[display_df['sku'].astype(str) == s, 'name'].iloc[0][:42]}"
+                        if len(display_df.loc[display_df["sku"].astype(str) == s]) else s
+                    ),
+                )
+                sync_df = display_df[display_df["sku"].astype(str).isin(pick_skus)].copy()
+                sync_df = sync_df.drop_duplicates(subset=["sku"], keep="last")
+                if st.button("🚀 تحديث المتجر الآن", type="primary", key="btn_pricing_bulk_sync", use_container_width=True):
+                    payload = build_pricing_sync_payload(
+                        sync_df,
+                        skip_unchanged=skip_sync_unchanged,
+                    )
+                    if not payload:
+                        st.warning(
+                            "لا توجد عناصر جاهزة للإرسال. تحقق من السعر المقترح، أو ألغِ «تخطي دون تغيّر»."
+                        )
+                    else:
+                        with st.spinner(f"جاري الإرسال إلى Make ({len(payload)} منتجاً)..."):
+                            out = bulk_sync_pricing_recommendations(
+                                payload,
+                                batch_size=int(batch_sz),
+                                use_safe=use_safe_sync,
+                            )
+                        db_log("pricing_dashboard", "bulk_sync_make", f"n={len(payload)}")
+                        if out.get("success"):
+                            st.success(out.get("message", "تم"))
+                        else:
+                            st.error(out.get("message", "فشل غير معروف"))
+                        if out.get("details"):
+                            with st.expander("تفاصيل الدفعات", expanded=False):
+                                for ln in out.get("details", []):
+                                    st.caption(ln)
+
+            from utils.ui_components import render_product_cards
+
+            render_product_cards(display_df)
 
 
 # ════════════════════════════════════════════════
@@ -1036,7 +1352,109 @@ elif page == "📂 رفع الملفات":
     with col_opt1:
         bg_mode  = st.checkbox("⚡ معالجة خلفية (يمكنك التنقل أثناء التحليل)", value=True)
     with col_opt2:
-        max_rows = st.number_input("حد الصفوف للمعالجة (0=كل)", 0, step=500)
+        max_rows = st.number_input(
+            "حد الصفوف لملف منتجاتنا فقط (0=كل)",
+            min_value=0,
+            max_value=500_000,
+            value=0,
+            step=500,
+            help="ضع 0 لمعالجة آلاف الصفوف دفعة واحدة. يقتصر الحد على ملف «منتجاتنا» فقط.",
+        )
+
+    # ── تعيين أعمدة (قائمة منسدلة مصغّرة داخل expander) ──
+    if our_file and comp_files:
+        our_peek, our_peek_err = read_file(our_file, preview_rows=_PEEK_ROWS)
+        if our_peek_err:
+            st.warning(f"⚠️ معاينة أعمدة منتجاتنا: {our_peek_err}")
+        elif our_peek is not None and len(our_peek.columns) > 0:
+            _osig = _upload_file_sig(our_file)
+            _oc = [str(c) for c in our_peek.columns]
+            _dn, _dp, _di = guess_default_columns(our_peek)
+            _id_opts = [_NO_ID_LABEL] + _oc
+            _idi = 0
+            if _di and _di in _oc:
+                _idi = _oc.index(_di) + 1
+            with st.expander("📋 تعيين الأعمدة — تحقق يدوي (منسدل)", expanded=False):
+                st.caption(
+                    "يُعاد تسمية المختار داخلياً إلى: **اسم المنتج**، **السعر**، و**رقم المنتج** (إن وُجد)."
+                )
+                st.caption(
+                    "**المعرّف (اختياري):** عمود يثبت هوية الصنف — مثل رقم المنتج، SKU، الباركود، أو كود ERP. "
+                    "يُحسّن مطابقة الكتالوج عند إعادة رفع الملف. **إن لم يوجد** في الجدول، اختر «بدون معرّف»."
+                )
+                u1, u2, u3 = st.columns(3)
+                with u1:
+                    _sn = st.selectbox(
+                        "منتجاتنا · الاسم",
+                        _oc,
+                        index=_col_select_index(_oc, _dn),
+                        key=f"map_our_n_{_osig}",
+                        help="عمود اسم المنتج الظاهر للعميل.",
+                    )
+                with u2:
+                    _sp = st.selectbox(
+                        "منتجاتنا · السعر",
+                        _oc,
+                        index=_col_select_index(_oc, _dp),
+                        help="عمود السعر الرقمي (ر.س أو ما يعادله).",
+                    )
+                with u3:
+                    _si = st.selectbox(
+                        "منتجاتنا · المعرّف",
+                        _id_opts,
+                        index=_idi,
+                        key=f"map_our_i_{_osig}",
+                        help="SKU / رقم منتج / باركود — أو «بدون معرّف».",
+                    )
+                st.session_state["_colmap_our"] = (
+                    _sn,
+                    _sp,
+                    None if _si == _NO_ID_LABEL else _si,
+                )
+                st.session_state["_colmap_comp"] = {}
+                for _ci, _cf in enumerate(comp_files):
+                    _cdf, _ce = read_file(_cf, preview_rows=_PEEK_ROWS)
+                    if _ce or _cdf is None or len(_cdf.columns) == 0:
+                        st.caption(f"🏪 `{_cf.name}` — تعذر قراءة المعاينة: {_ce or 'لا أعمدة'}")
+                        continue
+                    _cc = [str(c) for c in _cdf.columns]
+                    _cn, _cp, _cid = guess_default_columns(_cdf)
+                    _csig = _upload_file_sig(_cf)
+                    _cid_opts = [_NO_ID_LABEL] + _cc
+                    _cidi = 0
+                    if _cid and _cid in _cc:
+                        _cidi = _cc.index(_cid) + 1
+                    st.markdown(f"**🏪 {_cf.name}**")
+                    k1, k2, k3 = st.columns(3)
+                    with k1:
+                        _cnm = st.selectbox(
+                            "الاسم",
+                            _cc,
+                            index=_col_select_index(_cc, _cn),
+                            key=f"map_c{_ci}_n_{_csig}",
+                            help="اسم المنتج عند المنافس.",
+                        )
+                    with k2:
+                        _cpr = st.selectbox(
+                            "السعر",
+                            _cc,
+                            index=_col_select_index(_cc, _cp),
+                            key=f"map_c{_ci}_p_{_csig}",
+                            help="سعر المنافس (رقم).",
+                        )
+                    with k3:
+                        _cidv = st.selectbox(
+                            "المعرّف",
+                            _cid_opts,
+                            index=_cidi,
+                            key=f"map_c{_ci}_i_{_csig}",
+                            help="اختياري — كود/SKU إن وُجد؛ وإلا «بدون معرّف».",
+                        )
+                    st.session_state["_colmap_comp"][_csig] = (
+                        _cnm,
+                        _cpr,
+                        None if _cidv == _NO_ID_LABEL else _cidv,
+                    )
 
     if st.button("🚀 بدء التحليل", type="primary"):
         if our_file and comp_files:
@@ -1044,16 +1462,38 @@ elif page == "📂 رفع الملفات":
             if err:
                 st.error(f"❌ {err}")
             else:
+                _omap = st.session_state.get("_colmap_our")
+                _cmap = st.session_state.get("_colmap_comp", {})
+                if _omap:
+                    _on, _op, _oi = _omap
+                    our_df = apply_column_mapping(our_df, _on, _op, _oi)
+                else:
+                    _gdn, _gdp, _gdi = guess_default_columns(our_df)
+                    our_df = apply_column_mapping(our_df, _gdn, _gdp, _gdi)
                 if max_rows > 0:
                     our_df = our_df.head(int(max_rows))
 
                 comp_dfs = {}
                 for cf in comp_files:
                     cdf, cerr = read_file(cf)
-                    if cerr: st.warning(f"⚠️ {cf.name}: {cerr}")
-                    else: comp_dfs[cf.name] = cdf
+                    if cerr:
+                        st.warning(f"⚠️ {cf.name}: {cerr}")
+                    else:
+                        _cs = _upload_file_sig(cf)
+                        _trip = _cmap.get(_cs)
+                        if _trip:
+                            _pn, _pp, _pid = _trip
+                            cdf = apply_column_mapping(cdf, _pn, _pp, _pid)
+                        else:
+                            _gn, _gp, _gi = guess_default_columns(cdf)
+                            cdf = apply_column_mapping(cdf, _gn, _gp, _gi)
+                        comp_dfs[cf.name] = cdf
 
                 if comp_dfs:
+                    _comp_rows = sum(len(x) for x in comp_dfs.values())
+                    st.caption(
+                        f"📄 **منتجاتنا:** {len(our_df)} صف — **المنافسون:** {_comp_rows} صفاً عبر {len(comp_dfs)} ملفاً"
+                    )
                     # ── v26: upsert كتالوج يومي بدون تكرار ──────────
                     with st.spinner("📦 تحديث الكتالوج اليومي..."):
                         r_our  = upsert_our_catalog(our_df,
@@ -1091,13 +1531,13 @@ elif page == "📂 رفع الملفات":
                         missing_df = find_missing_products(our_df, comp_dfs)
 
                         for _, row in df_all.iterrows():
-                            if row.get("نسبة_التطابق", 0) > 0:
+                            if row.get("match_score", 0) > 0:
                                 upsert_price_history(
                                     str(row.get("المنتج","")), str(row.get("المنافس","")),
                                     safe_float(row.get("سعر_المنافس",0)),
                                     safe_float(row.get("السعر",0)),
                                     safe_float(row.get("الفرق",0)),
-                                    safe_float(row.get("نسبة_التطابق",0)),
+                                    safe_float(row.get("match_score",0)),
                                     str(row.get("القرار",""))
                                 )
 
@@ -1106,7 +1546,7 @@ elif page == "📂 رفع الملفات":
                         st.session_state.results     = _r
                         st.session_state.analysis_df = df_all
                         log_analysis(our_file.name, comp_names, len(our_df),
-                                     int((df_all.get("نسبة_التطابق", pd.Series(dtype=float)) > 0).sum()),
+                                     int((df_all.get("match_score", pd.Series(dtype=float)) > 0).sum()),
                                      len(missing_df))
                         prog.progress(1.0, "✅ اكتمل!")
                         st.balloons()
@@ -1257,7 +1697,7 @@ elif page == "🔍 منتجات مفقودة":
                 variant_f= c4.selectbox("النوع",
                     ["الكل","مفقود فعلاً","يوجد تستر","يوجد الأساسي"], key="miss_v")
                 conf_f   = c5.selectbox("الثقة",
-                    ["الكل","🟢 مؤكد","🟡 محتمل","🔴 مشكوك"], key="miss_conf_f")
+                    ["الكل","🟢 ثقة قوية","🟡 ثقة متوسطة","🔴 مشكوك"], key="miss_conf_f")
 
             filtered = df.copy()
             if search:
@@ -1274,7 +1714,7 @@ elif page == "🔍 منتجات مفقودة":
                 filtered = filtered[filtered["نوع_متاح"].str.contains("الأساسي", na=False)]
             # فلتر الثقة
             if conf_f != "الكل" and "مستوى_الثقة" in filtered.columns:
-                _conf_map = {"🟢 مؤكد": "green", "🟡 محتمل": "yellow", "🔴 مشكوك": "red"}
+                _conf_map = {"🟢 ثقة قوية": "green", "🟡 ثقة متوسطة": "yellow", "🔴 مشكوك": "red"}
                 _cv = _conf_map.get(conf_f, "")
                 if _cv:
                     filtered = filtered[filtered["مستوى_الثقة"] == _cv]
@@ -1297,7 +1737,7 @@ elif page == "🔍 منتجات مفقودة":
                 st.download_button("📄 CSV", data=_csv_m, file_name="missing.csv", mime="text/csv", key="miss_csv")
             with cc3:
                 # ── خيارات الإرسال الذكي ─────────────────────────────
-                _conf_opts = {"🟢 مؤكدة فقط": "green", "🟡 محتملة": "yellow", "🔵 الكل": ""}
+                _conf_opts = {"🟢 ثقة قوية فقط": "green", "🟡 ثقة متوسطة فقط": "yellow", "🔵 الكل": ""}
                 _conf_sel = st.selectbox("مستوى الثقة", list(_conf_opts.keys()), key="miss_conf_sel")
                 _conf_val = _conf_opts[_conf_sel]
                 if st.button("📤 إرسال بدفعات ذكية لـ Make", key="miss_make_all"):
@@ -1678,7 +2118,7 @@ elif page == "⚠️ تحت المراجعة":
                 comp_name  = str(row.get("منتج_المنافس","—"))
                 our_price  = safe_float(row.get("السعر",0))
                 comp_price = safe_float(row.get("سعر_المنافس",0))
-                score      = safe_float(row.get("نسبة_التطابق",0))
+                score      = safe_float(row.get("match_score",0))
                 brand      = str(row.get("الماركة",""))
                 size       = str(row.get("الحجم",""))
                 comp_name_s= str(row.get("المنافس",""))
@@ -2273,7 +2713,7 @@ elif page == "⚙️ الإعدادات":
     st.header("⚙️ الإعدادات")
     db_log("settings", "view")
 
-    tab1, tab2, tab3 = st.tabs(["🔑 المفاتيح", "⚙️ المطابقة", "📜 السجل"])
+    tab1, tab2, tab3, tab4 = st.tabs(["🔑 المفاتيح", "⚙️ المطابقة", "📜 السجل", "🏢 المنافسين (Sitemap)"])
 
     with tab1:
         # ── الحالة الحالية ────────────────────────────────────────────────
@@ -2399,6 +2839,81 @@ elif page == "⚙️ الإعدادات":
         else:
             st.info("لا توجد قرارات مسجلة")
 
+    with tab4:
+        render_competitor_management_ui()
+
+        import os
+        import pandas as pd
+        import asyncio
+        from utils.async_scraper import run_scraper_engine
+
+        st.markdown("---")
+        st.subheader("🤖 تشغيل محرك الكشط وعرض النتائج")
+        st.info("سيسحب هذا المحرك أحدث أسعار المنافسين بناءً على الروابط المدخلة ويعرضها فوراً.")
+
+        # 1. The Scraper Button
+        if st.button("🚀 بدء جلب بيانات المنافسين الآن", use_container_width=True):
+            with st.spinner("جاري اختراق الموقع وسحب البيانات... يرجى الانتظار."):
+                try:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    loop.run_until_complete(run_scraper_engine())
+                    st.success("✅ تمت عملية الكشط بنجاح!")
+                    # CRITICAL: Force Streamlit to refresh and read the newly created file
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"❌ حدث خطأ أثناء الكشط: {str(e)}")
+
+        # ملخص أداء آخر تشغيل (من scraper_last_run.json)
+        meta_path = os.path.join(os.getcwd(), "data", "scraper_last_run.json")
+        if os.path.exists(meta_path):
+            try:
+                import json as _json
+
+                with open(meta_path, "r", encoding="utf-8") as _mf:
+                    sm = _json.load(_mf)
+                st.markdown("### 📈 ملخص أداء آخر كشط")
+                st.caption(
+                    f"آخر تحديث (UTC): `{sm.get('finished_at', '—')}` · الحالة: **{sm.get('status', '—')}**"
+                )
+                c1, c2, c3, c4 = st.columns(4)
+                with c1:
+                    st.metric("روابط في الطابور", f"{sm.get('urls_queued', 0):,}")
+                with c2:
+                    st.metric("صفوف في CSV", f"{sm.get('rows_written_csv', 0):,}")
+                with c3:
+                    st.metric("نسبة النجاح", f"{sm.get('success_rate_pct', 0.0):.1f}%")
+                with c4:
+                    st.metric("المدة (ث)", f"{sm.get('duration_seconds', 0):.1f}")
+                c5, c6, c7 = st.columns(3)
+                with c5:
+                    st.metric("قبل إزالة التكرار", f"{sm.get('rows_extracted_before_dedupe', 0):,}")
+                with c6:
+                    st.metric("طلبات فاشلة (استثناء)", f"{sm.get('fetch_exceptions', 0):,}")
+                with c7:
+                    st.metric("بدون استخراج (فراغ)", f"{sm.get('parse_null', 0):,}")
+            except Exception:
+                pass
+
+        # 2. Persistent Data Viewer (Always visible if the file exists)
+        st.markdown("### 📊 البيانات المسحوبة من المنافسين")
+        data_path = os.path.join(os.getcwd(), "data", "competitors_latest.csv")
+
+        if os.path.exists(data_path):
+            try:
+                df_comp = pd.read_csv(data_path)
+                if df_comp.empty:
+                    st.warning(
+                        "⚠️ تمت عملية الكشط، ولكن الملف فارغ! تأكد أن رابط الـ Sitemap صحيح ويحتوي على منتجات."
+                    )
+                else:
+                    st.success(f"✅ تم العثور على {len(df_comp)} منتج مسحوب وجاهز للمطابقة.")
+                    st.dataframe(df_comp, use_container_width=True, height=400)
+            except Exception as e:
+                st.error(f"❌ حدث خطأ في قراءة ملف البيانات: {str(e)}")
+        else:
+            st.warning("⚠️ لا توجد أي بيانات مسحوبة حالياً. اضغط على زر الجلب أعلاه للبدء.")
+
 
 # ════════════════════════════════════════════════
 #  11. السجل
@@ -2473,7 +2988,12 @@ elif page == "🔄 الأتمتة الذكية":
 
         if st.session_state.results and st.session_state.analysis_df is not None:
             adf = st.session_state.analysis_df
-            matched_df = adf[adf["نسبة_التطابق"].apply(lambda x: safe_float(x)) >= 85].copy()
+            _msc = _match_score_col(adf)
+            if _msc is None:
+                st.warning("لا يوجد عمود **match_score** أو **نسبة_التطابق** في نتائج التحليل — أعد تشغيل التحليل من «رفع الملفات».")
+                matched_df = pd.DataFrame()
+            else:
+                matched_df = adf[adf[_msc].apply(lambda x: safe_float(x)) >= 85].copy()
             st.info(f"📦 {len(matched_df)} منتج مؤكد المطابقة جاهز للتقييم التلقائي")
 
             col_a, col_b = st.columns(2)
