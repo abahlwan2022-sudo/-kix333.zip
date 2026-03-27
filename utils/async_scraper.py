@@ -44,6 +44,63 @@ def _stable_sku_from_url(url: str) -> str:
     return hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
 
 
+def _extract_brand_from_product(data: dict) -> str:
+    """brand في schema.org قد يكون نصاً أو Brand { name }."""
+    b = data.get("brand")
+    if b is None:
+        return ""
+    if isinstance(b, str):
+        return b.strip()
+    if isinstance(b, dict):
+        n = b.get("name") or b.get("@value")
+        if isinstance(n, dict):
+            n = n.get("value") or n.get("text")
+        return str(n or "").strip()
+    if isinstance(b, list) and b:
+        x = b[0]
+        if isinstance(x, dict):
+            return _extract_brand_from_product({"brand": x})
+        return str(x).strip()
+    return str(b).strip()
+
+
+def _extract_image_url_from_product(data: dict) -> str:
+    """صورة المنتج: نص، أو ImageObject، أو قائمة."""
+    img = data.get("image")
+    if img is None:
+        return ""
+    if isinstance(img, str):
+        return img.strip()
+    if isinstance(img, dict):
+        u = img.get("url") or img.get("contentUrl") or img.get("@id")
+        return str(u or "").strip()
+    if isinstance(img, list) and img:
+        first = img[0]
+        if isinstance(first, str):
+            return first.strip()
+        if isinstance(first, dict):
+            u = first.get("url") or first.get("contentUrl")
+            return str(u or "").strip()
+    return ""
+
+
+def _filter_salla_like_product_urls(urls: List[str]) -> List[str]:
+    """يحتفظ بصفحات منتج سلة/زد النموذجية (.../اسم-المنتج/p123456789) ويستبعد المدونة والأقسام وروابط CDN."""
+    out: List[str] = []
+    for u in urls:
+        try:
+            p = urlparse(u)
+        except Exception:
+            continue
+        host = (p.netloc or "").lower()
+        if "cdn.salla.sa" in host or host.startswith("cdn."):
+            continue
+        path = p.path or ""
+        if re.search(r"/p\d+$", path):
+            out.append(u)
+    return list(dict.fromkeys(out))
+
+
 def _parse_price_from_text(text: str) -> Optional[float]:
     if not text:
         return None
@@ -128,7 +185,8 @@ class AsyncCompetitorScraper:
                 "image/avif,image/webp,image/apng,*/*;q=0.8"
             ),
             "Accept-Language": "ar-SA,ar;q=0.9,en-US;q=0.8,en;q=0.7",
-            "Accept-Encoding": "gzip, deflate, br",
+            # بدون br: aiohttp يحتاج حزمة brotli لفك br؛ gzip/deflate كافٍ لمعظم الخوادم
+            "Accept-Encoding": "gzip, deflate",
             "Referer": ref,
             "DNT": "1",
             "Connection": "keep-alive",
@@ -240,10 +298,14 @@ class AsyncCompetitorScraper:
             sku = str(sku).strip()
 
         price_out = float(price_val) if price_val is not None else 0.0
+        brand = _extract_brand_from_product(data)
+        image_url = _extract_image_url_from_product(data)
         return {
-            "comp_url": url,
             "name": name,
             "price": price_out,
+            "brand": brand,
+            "image_url": image_url,
+            "comp_url": url,
             "sku": sku,
         }
 
@@ -271,10 +333,15 @@ class AsyncCompetitorScraper:
         if price is None:
             return None
 
+        og_img = soup.find("meta", property="og:image")
+        image_url = str(og_img["content"]).strip() if og_img and og_img.get("content") else ""
+
         return {
-            "comp_url": url,
             "name": name,
             "price": float(price),
+            "brand": "",
+            "image_url": image_url,
+            "comp_url": url,
             "sku": _stable_sku_from_url(url),
         }
 
@@ -345,10 +412,18 @@ class AsyncCompetitorScraper:
                             else (str(soup.title.string).strip() if soup.title and soup.title.string else "")
                         )
                         if nm:
+                            og_img = soup.find("meta", property="og:image")
+                            image_url = (
+                                str(og_img["content"]).strip()
+                                if og_img and og_img.get("content")
+                                else ""
+                            )
                             return {
-                                "comp_url": url,
                                 "name": nm,
                                 "price": float(p),
+                                "brand": "",
+                                "image_url": image_url,
+                                "comp_url": url,
                                 "sku": _stable_sku_from_url(url),
                             }
             return None
@@ -401,17 +476,34 @@ async def run_scraper_engine() -> None:
     async with aiohttp.ClientSession() as session:
         for sitemap in competitor_sitemaps:
             urls, diag = await scraper.scan_sitemap(session, sitemap)
+            raw_len = len(urls)
+            urls = _filter_salla_like_product_urls(urls)
             sitemap_diagnostics.append(
                 {
                     "sitemap": sitemap,
-                    "urls_found": len(urls),
+                    "urls_found": raw_len,
+                    "urls_product_pages": len(urls),
                     "http_status": diag.get("http_status"),
                     "fetch_error": diag.get("fetch_error"),
                     "parse_error": diag.get("parse_error"),
                 }
             )
             if not urls:
+                logger.warning(
+                    "No product-like URLs after filter (raw from sitemap: %s).",
+                    raw_len,
+                )
                 continue
+
+            max_urls_env = os.environ.get("SCRAPER_MAX_URLS", "").strip()
+            if max_urls_env:
+                try:
+                    lim = int(max_urls_env)
+                    if lim > 0 and len(urls) > lim:
+                        logger.info("SCRAPER_MAX_URLS=%s — limiting to %s URLs", lim, lim)
+                        urls = urls[:lim]
+                except ValueError:
+                    pass
 
             urls_queued += len(urls)
             logger.info("Starting async fetch for %s products from %s...", len(urls), sitemap)
@@ -439,13 +531,28 @@ async def run_scraper_engine() -> None:
 
     if all_results:
         os.makedirs("data", exist_ok=True)
+        _col_order = ["name", "price", "brand", "image_url", "comp_url", "sku"]
         df = pd.DataFrame(all_results).drop_duplicates(subset=["comp_url"])
+        for c in _col_order:
+            if c not in df.columns:
+                df[c] = ""
+        df = df[_col_order]
         rows_written = len(df)
 
         temp_file = "data/competitors_temp.csv"
         final_file = "data/competitors_latest.csv"
 
-        df.to_csv(temp_file, index=False, encoding="utf-8-sig")
+        df_ar = df.rename(
+            columns={
+                "name": "الاسم",
+                "price": "السعر",
+                "brand": "الماركة",
+                "image_url": "رابط_الصورة",
+                "comp_url": "رابط_المنتج",
+                "sku": "sku",
+            }
+        )
+        df_ar.to_csv(temp_file, index=False, encoding="utf-8-sig")
         shutil.move(temp_file, final_file)
 
         logger.info("JOB DONE. Saved %s records to %s securely.", rows_written, final_file)
