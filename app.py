@@ -57,13 +57,33 @@ from utils.db_manager import check_strict_duplicate
 from utils.helpers import (apply_filters, get_filter_options, export_to_excel,
                             export_multiple_sheets, parse_pasted_text,
                             safe_float, format_price, format_diff)
-from utils.make_helper import (send_price_updates, send_new_products,
-                                send_missing_products, send_single_product,
-                                verify_webhook_connection, export_to_make_format,
-                                send_batch_smart, build_pricing_sync_payload,
-                                bulk_sync_pricing_recommendations,
-                                is_pricing_webhook_configured,
-                                send_approved_prices_to_make)
+try:
+    from utils.make_helper import (send_price_updates, send_new_products,
+                                    send_missing_products, send_single_product,
+                                    verify_webhook_connection, export_to_make_format,
+                                    send_batch_smart, build_pricing_sync_payload,
+                                    bulk_sync_pricing_recommendations,
+                                    is_pricing_webhook_configured,
+                                    send_approved_prices_to_make)
+except Exception:
+    # Fallback for environments running older cached make_helper versions.
+    from utils import make_helper as _mkh
+
+    send_price_updates = _mkh.send_price_updates
+    send_new_products = _mkh.send_new_products
+    send_missing_products = _mkh.send_missing_products
+    send_single_product = _mkh.send_single_product
+    verify_webhook_connection = _mkh.verify_webhook_connection
+    export_to_make_format = _mkh.export_to_make_format
+    send_batch_smart = _mkh.send_batch_smart
+    build_pricing_sync_payload = _mkh.build_pricing_sync_payload
+    bulk_sync_pricing_recommendations = _mkh.bulk_sync_pricing_recommendations
+    is_pricing_webhook_configured = _mkh.is_pricing_webhook_configured
+    send_approved_prices_to_make = getattr(_mkh, "send_approved_prices_to_make", None)
+
+    if send_approved_prices_to_make is None:
+        def send_approved_prices_to_make(df):
+            return False
 from utils.competitor_manager import render_competitor_scrape_page
 from utils.db_manager import (init_db, log_event, log_decision,
                                log_analysis, get_events, get_decisions,
