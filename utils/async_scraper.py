@@ -27,12 +27,54 @@ from bs4 import BeautifulSoup
 logger = logging.getLogger(__name__)
 
 SCRAPER_LAST_RUN_JSON = os.path.join("data", "scraper_last_run.json")
+SCRAPER_PROGRESS_JSON = os.path.join("data", "scraper_progress.json")
 
 
 def _write_scraper_last_run_meta(payload: Dict[str, Any]) -> None:
     os.makedirs("data", exist_ok=True)
     with open(SCRAPER_LAST_RUN_JSON, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
+
+
+def _merge_scraper_progress(updates: Dict[str, Any]) -> None:
+    prev: Dict[str, Any] = {}
+    if os.path.exists(SCRAPER_PROGRESS_JSON):
+        try:
+            with open(SCRAPER_PROGRESS_JSON, "r", encoding="utf-8") as f:
+                prev = json.load(f)
+        except Exception:
+            pass
+    prev.update(updates)
+    os.makedirs("data", exist_ok=True)
+    with open(SCRAPER_PROGRESS_JSON, "w", encoding="utf-8") as f:
+        json.dump(prev, f, ensure_ascii=False, indent=2)
+
+
+def _save_competitor_csv_rows(rows: List[Dict[str, Any]]) -> int:
+    """يكتب competitors_latest.csv من قائمة صفوف. يعيد عدد الصفوف بعد إزالة التكرار."""
+    if not rows:
+        return 0
+    _col_order = ["name", "price", "brand", "image_url", "comp_url", "sku"]
+    df = pd.DataFrame(rows).drop_duplicates(subset=["comp_url"])
+    for c in _col_order:
+        if c not in df.columns:
+            df[c] = ""
+    df = df[_col_order]
+    temp_file = "data/competitors_temp.csv"
+    final_file = "data/competitors_latest.csv"
+    df_ar = df.rename(
+        columns={
+            "name": "الاسم",
+            "price": "السعر",
+            "brand": "الماركة",
+            "image_url": "رابط_الصورة",
+            "comp_url": "رابط_المنتج",
+            "sku": "sku",
+        }
+    )
+    df_ar.to_csv(temp_file, index=False, encoding="utf-8-sig")
+    shutil.move(temp_file, final_file)
+    return len(df)
 
 
 def _tag_local(tag: str) -> str:
@@ -433,9 +475,11 @@ class AsyncCompetitorScraper:
 
 
 async def run_scraper_engine() -> None:
-    """المحرك الرئيسي الذي يشغل العملية بالكامل ويقرأ من JSON"""
+    """المحرك الرئيسي الذي يشغل العملية بالكامل ويقرأ من JSON.
+    يحدّث `competitors_latest.csv` و `scraper_progress.json` بعد كل دفعة جلب."""
     logger.info("Starting High-Speed Async Scraper Engine...")
     t0 = time.perf_counter()
+    finished_at = datetime.now(timezone.utc).isoformat()
 
     competitors_file = "data/competitors_list.json"
     competitor_sitemaps: List[str] = []
@@ -449,10 +493,17 @@ async def run_scraper_engine() -> None:
 
     if not competitor_sitemaps:
         logger.info("No sitemaps found in config. Please add them via the UI. Exiting.")
+        _merge_scraper_progress(
+            {
+                "running": False,
+                "finished_at": finished_at,
+                "last_error": None,
+            }
+        )
         _write_scraper_last_run_meta(
             {
                 "status": "no_sitemaps",
-                "finished_at": datetime.now(timezone.utc).isoformat(),
+                "finished_at": finished_at,
                 "duration_seconds": round(time.perf_counter() - t0, 2),
                 "sitemaps_count": 0,
                 "urls_queued": 0,
@@ -469,124 +520,170 @@ async def run_scraper_engine() -> None:
     scraper = AsyncCompetitorScraper(concurrency_limit=15)
     all_results: List[Dict[str, Any]] = []
     urls_queued = 0
+    urls_processed_total = 0
     fetch_exceptions = 0
     parse_null = 0
     sitemap_diagnostics: List[Dict[str, Any]] = []
+    started = datetime.now(timezone.utc).isoformat()
+    _merge_scraper_progress(
+        {
+            "running": True,
+            "started_at": started,
+            "finished_at": None,
+            "urls_total": 0,
+            "urls_processed": 0,
+            "rows_in_csv": 0,
+            "current_sitemap": None,
+            "last_error": None,
+        }
+    )
 
-    async with aiohttp.ClientSession() as session:
-        for sitemap in competitor_sitemaps:
-            urls, diag = await scraper.scan_sitemap(session, sitemap)
-            raw_len = len(urls)
-            urls = _filter_salla_like_product_urls(urls)
-            sitemap_diagnostics.append(
+    try:
+        async with aiohttp.ClientSession() as session:
+            for sitemap in competitor_sitemaps:
+                urls, diag = await scraper.scan_sitemap(session, sitemap)
+                raw_len = len(urls)
+                urls = _filter_salla_like_product_urls(urls)
+                sitemap_diagnostics.append(
+                    {
+                        "sitemap": sitemap,
+                        "urls_found": raw_len,
+                        "urls_product_pages": len(urls),
+                        "http_status": diag.get("http_status"),
+                        "fetch_error": diag.get("fetch_error"),
+                        "parse_error": diag.get("parse_error"),
+                    }
+                )
+                if not urls:
+                    logger.warning(
+                        "No product-like URLs after filter (raw from sitemap: %s).",
+                        raw_len,
+                    )
+                    continue
+
+                max_urls_env = os.environ.get("SCRAPER_MAX_URLS", "").strip()
+                if max_urls_env:
+                    try:
+                        lim = int(max_urls_env)
+                        if lim > 0 and len(urls) > lim:
+                            logger.info(
+                                "SCRAPER_MAX_URLS=%s — limiting to %s URLs", lim, lim
+                            )
+                            urls = urls[:lim]
+                    except ValueError:
+                        pass
+
+                urls_queued += len(urls)
+                _merge_scraper_progress(
+                    {
+                        "current_sitemap": sitemap,
+                        "urls_total": urls_queued,
+                    }
+                )
+                logger.info(
+                    "Starting async fetch for %s products from %s...", len(urls), sitemap
+                )
+                tasks = [scraper.fetch_and_parse_url(session, url) for url in urls]
+
+                chunk_size = 400
+                for i in range(0, len(tasks), chunk_size):
+                    chunk_tasks = tasks[i : i + chunk_size]
+                    results = await asyncio.gather(*chunk_tasks, return_exceptions=True)
+
+                    for r in results:
+                        if isinstance(r, Exception):
+                            fetch_exceptions += 1
+                        elif r is None:
+                            parse_null += 1
+
+                    valid_results = [
+                        r for r in results if r is not None and not isinstance(r, Exception)
+                    ]
+                    all_results.extend(valid_results)
+                    urls_processed_total += len(chunk_tasks)
+
+                    rows_saved = _save_competitor_csv_rows(all_results)
+                    _merge_scraper_progress(
+                        {
+                            "running": True,
+                            "urls_total": urls_queued,
+                            "urls_processed": urls_processed_total,
+                            "rows_in_csv": rows_saved,
+                            "current_sitemap": sitemap,
+                        }
+                    )
+
+                logger.info("Finished processing %s.", sitemap)
+
+        duration = round(time.perf_counter() - t0, 2)
+        finished_at = datetime.now(timezone.utc).isoformat()
+        rows_before = len(all_results)
+        rows_written = (
+            len(pd.DataFrame(all_results).drop_duplicates(subset=["comp_url"]))
+            if all_results
+            else 0
+        )
+
+        if all_results:
+            logger.info(
+                "JOB DONE. Saved %s records to data/competitors_latest.csv securely.",
+                rows_written,
+            )
+            success_rate = (
+                round((rows_written / urls_queued) * 100, 2) if urls_queued else 0.0
+            )
+            _write_scraper_last_run_meta(
                 {
-                    "sitemap": sitemap,
-                    "urls_found": raw_len,
-                    "urls_product_pages": len(urls),
-                    "http_status": diag.get("http_status"),
-                    "fetch_error": diag.get("fetch_error"),
-                    "parse_error": diag.get("parse_error"),
+                    "status": "ok",
+                    "finished_at": finished_at,
+                    "duration_seconds": duration,
+                    "sitemaps_count": len(competitor_sitemaps),
+                    "urls_queued": urls_queued,
+                    "rows_extracted_before_dedupe": rows_before,
+                    "rows_written_csv": rows_written,
+                    "fetch_exceptions": fetch_exceptions,
+                    "parse_null": parse_null,
+                    "success_rate_pct": success_rate,
+                    "sitemap_diagnostics": sitemap_diagnostics,
                 }
             )
-            if not urls:
-                logger.warning(
-                    "No product-like URLs after filter (raw from sitemap: %s).",
-                    raw_len,
-                )
-                continue
-
-            max_urls_env = os.environ.get("SCRAPER_MAX_URLS", "").strip()
-            if max_urls_env:
-                try:
-                    lim = int(max_urls_env)
-                    if lim > 0 and len(urls) > lim:
-                        logger.info("SCRAPER_MAX_URLS=%s — limiting to %s URLs", lim, lim)
-                        urls = urls[:lim]
-                except ValueError:
-                    pass
-
-            urls_queued += len(urls)
-            logger.info("Starting async fetch for %s products from %s...", len(urls), sitemap)
-            tasks = [scraper.fetch_and_parse_url(session, url) for url in urls]
-
-            chunk_size = 400
-            for i in range(0, len(tasks), chunk_size):
-                chunk_tasks = tasks[i : i + chunk_size]
-                results = await asyncio.gather(*chunk_tasks, return_exceptions=True)
-
-                for r in results:
-                    if isinstance(r, Exception):
-                        fetch_exceptions += 1
-                    elif r is None:
-                        parse_null += 1
-
-                valid_results = [r for r in results if r is not None and not isinstance(r, Exception)]
-                all_results.extend(valid_results)
-
-            logger.info("Finished processing %s.", sitemap)
-
-    duration = round(time.perf_counter() - t0, 2)
-    finished_at = datetime.now(timezone.utc).isoformat()
-    rows_before = len(all_results)
-
-    if all_results:
-        os.makedirs("data", exist_ok=True)
-        _col_order = ["name", "price", "brand", "image_url", "comp_url", "sku"]
-        df = pd.DataFrame(all_results).drop_duplicates(subset=["comp_url"])
-        for c in _col_order:
-            if c not in df.columns:
-                df[c] = ""
-        df = df[_col_order]
-        rows_written = len(df)
-
-        temp_file = "data/competitors_temp.csv"
-        final_file = "data/competitors_latest.csv"
-
-        df_ar = df.rename(
-            columns={
-                "name": "الاسم",
-                "price": "السعر",
-                "brand": "الماركة",
-                "image_url": "رابط_الصورة",
-                "comp_url": "رابط_المنتج",
-                "sku": "sku",
+        else:
+            _write_scraper_last_run_meta(
+                {
+                    "status": "empty",
+                    "finished_at": finished_at,
+                    "duration_seconds": duration,
+                    "sitemaps_count": len(competitor_sitemaps),
+                    "urls_queued": urls_queued,
+                    "rows_extracted_before_dedupe": 0,
+                    "rows_written_csv": 0,
+                    "fetch_exceptions": fetch_exceptions,
+                    "parse_null": parse_null,
+                    "success_rate_pct": 0.0,
+                    "sitemap_diagnostics": sitemap_diagnostics,
+                }
+            )
+    except Exception as e:
+        logger.exception("Scraper engine failed: %s", e)
+        _merge_scraper_progress(
+            {
+                "last_error": str(e),
             }
         )
-        df_ar.to_csv(temp_file, index=False, encoding="utf-8-sig")
-        shutil.move(temp_file, final_file)
-
-        logger.info("JOB DONE. Saved %s records to %s securely.", rows_written, final_file)
-
-        success_rate = round((rows_written / urls_queued) * 100, 2) if urls_queued else 0.0
-        _write_scraper_last_run_meta(
-            {
-                "status": "ok",
-                "finished_at": finished_at,
-                "duration_seconds": duration,
-                "sitemaps_count": len(competitor_sitemaps),
-                "urls_queued": urls_queued,
-                "rows_extracted_before_dedupe": rows_before,
-                "rows_written_csv": rows_written,
-                "fetch_exceptions": fetch_exceptions,
-                "parse_null": parse_null,
-                "success_rate_pct": success_rate,
-                "sitemap_diagnostics": sitemap_diagnostics,
-            }
+        raise
+    finally:
+        _rows_final = (
+            len(pd.DataFrame(all_results).drop_duplicates(subset=["comp_url"]))
+            if all_results
+            else 0
         )
-    else:
-        _write_scraper_last_run_meta(
+        _merge_scraper_progress(
             {
-                "status": "empty",
-                "finished_at": finished_at,
-                "duration_seconds": duration,
-                "sitemaps_count": len(competitor_sitemaps),
-                "urls_queued": urls_queued,
-                "rows_extracted_before_dedupe": 0,
-                "rows_written_csv": 0,
-                "fetch_exceptions": fetch_exceptions,
-                "parse_null": parse_null,
-                "success_rate_pct": 0.0,
-                "sitemap_diagnostics": sitemap_diagnostics,
+                "running": False,
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+                "urls_total": urls_queued,
+                "urls_processed": urls_processed_total,
+                "rows_in_csv": _rows_final,
             }
         )
 
