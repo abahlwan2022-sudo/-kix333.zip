@@ -2892,6 +2892,15 @@ elif page == "⚙️ الإعدادات":
                     st.metric("طلبات فاشلة (استثناء)", f"{sm.get('fetch_exceptions', 0):,}")
                 with c7:
                     st.metric("بدون استخراج (فراغ)", f"{sm.get('parse_null', 0):,}")
+                diag = sm.get("sitemap_diagnostics") or []
+                if diag:
+                    with st.expander("🔎 تشخيص روابط الـ Sitemap (حالة HTTP وأخطاء الجلب)", expanded=False):
+                        st.dataframe(pd.DataFrame(diag), use_container_width=True, hide_index=True)
+                        st.caption(
+                            "إذا ظهرت حالة **410 Gone** أو **404** فالرابط لم يعد متاحاً على الخادم — "
+                            "استبدله برابط sitemap حديث من المتجر (أو من لوحة تحكم سلة/زد). "
+                            "جرّب فتح الرابط في المتصفح؛ يجب أن يظهر ملف XML وليس صفحة خطأ."
+                        )
             except Exception:
                 pass
 
