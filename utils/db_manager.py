@@ -5,12 +5,28 @@ utils/db_manager.py - v18.0
 - قرارات لكل منتج (موافق/تأجيل/إزالة)
 - سجل كامل بالتاريخ والوقت
 """
-import sqlite3, json, os
+import sqlite3, json, os, tempfile
 from datetime import datetime
 
-# استخدام /tmp لضمان الكتابة على Streamlit Cloud (مجلد الكود read-only)
 _DB_NAME = "pricing_v18.db"
-DB_PATH = os.path.join("/tmp", _DB_NAME)
+
+
+def _resolve_db_path() -> str:
+    """
+    مسار ملف SQLite قابل للكتابة على كل المنصات.
+    - Linux / Streamlit Cloud / Railway: غالباً tempfile → /tmp
+    - Windows: مجلد Temp للمستخدم (لا تستخدم /tmp مباشرة — غير موجود أو غير قابل للكتابة)
+    - اختياري: MAHWOUS_DB_DIR=مسار_مجلد لفرض موقع (مثلاً قرص مرفق على السيرفر)
+    """
+    override = os.environ.get("MAHWOUS_DB_DIR", "").strip()
+    if override:
+        parent = os.path.abspath(override)
+        os.makedirs(parent, exist_ok=True)
+        return os.path.join(parent, _DB_NAME)
+    return os.path.join(tempfile.gettempdir(), _DB_NAME)
+
+
+DB_PATH = _resolve_db_path()
 
 
 def _ts():
@@ -294,10 +310,16 @@ def get_job_progress(job_id):
         conn.close()
         if row:
             d = dict(row)
-            try: d["results"] = json.loads(d.get("results_json", "[]"))
-            except: d["results"] = []
-            try: d["missing"] = json.loads(d.get("missing_json", "[]"))
-            except: d["missing"] = []
+            _rj = d.get("results_json") or "[]"
+            _mj = d.get("missing_json") or "[]"
+            try:
+                d["results"] = json.loads(_rj)
+            except Exception:
+                d["results"] = []
+            try:
+                d["missing"] = json.loads(_mj)
+            except Exception:
+                d["missing"] = []
             return d
     except: pass
     return None
@@ -312,13 +334,40 @@ def get_last_job():
         conn.close()
         if row:
             d = dict(row)
-            try: d["results"] = json.loads(d.get("results_json", "[]"))
-            except: d["results"] = []
-            try: d["missing"] = json.loads(d.get("missing_json", "[]"))
-            except: d["missing"] = []
+            _rj = d.get("results_json") or "[]"
+            _mj = d.get("missing_json") or "[]"
+            try:
+                d["results"] = json.loads(_rj)
+            except Exception:
+                d["results"] = []
+            try:
+                d["missing"] = json.loads(_mj)
+            except Exception:
+                d["missing"] = []
             return d
     except: pass
     return None
+
+
+def clear_missing_from_last_job():
+    """يمسح missing_json لآخر مهمة محفوظة حتى لا تُعاد المفقودات عند تحديث الصفحة."""
+    j = get_last_job()
+    if not j or not j.get("job_id"):
+        return False
+    try:
+        save_job_progress(
+            str(j["job_id"]),
+            int(j.get("total") or 0),
+            int(j.get("processed") or j.get("total") or 0),
+            j.get("results") or [],
+            status=str(j.get("status") or "done"),
+            our_file=j.get("our_file") or "",
+            comp_files=j.get("comp_files") or "",
+            missing=[],
+        )
+        return True
+    except Exception:
+        return False
 
 
 # ─── سجل التحليلات ─────────────────────────
@@ -495,10 +544,10 @@ def upsert_comp_catalog(comp_dfs: dict):
     total_new = 0
 
     for cname, cdf in comp_dfs.items():
-        # استكشاف الأعمدة
+        # استكشاف الأعمدة — يفضّل الأسماء المعيارية بعد التعيين اليدوي
         cols = list(cdf.columns)
-        name_col  = None
-        price_col = None
+        name_col  = "اسم المنتج" if "اسم المنتج" in cols else None
+        price_col = "السعر" if "السعر" in cols else None
         for c in cols:
             sample = str(cdf[c].dropna().iloc[0]) if not cdf[c].dropna().empty else ""
             try:

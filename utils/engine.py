@@ -997,7 +997,7 @@ def _row(product, our_price, our_id, brand, size, ptype, gender,
         return dict(المنتج=product, معرف_المنتج=our_id, السعر=our_price,
                     الماركة=brand, الحجم=sz_str, النوع=ptype, الجنس=gender,
                     منتج_المنافس="—", معرف_المنافس="", سعر_المنافس=0,
-                    الفرق=0, نسبة_التطابق=0, ثقة_AI="—",
+                    الفرق=0, match_score=0, ثقة_AI="—",
                     القرار=override or "🔍 منتجات مفقودة",
                     الخطورة="", المنافس="", عدد_المنافسين=0,
                     جميع_المنافسين=[], مصدر_المطابقة=src or "—",
@@ -1048,7 +1048,7 @@ def _row(product, our_price, our_id, brand, size, ptype, gender,
     return dict(المنتج=product, معرف_المنتج=our_id, السعر=our_price,
                 الماركة=brand, الحجم=sz_str, النوع=ptype, الجنس=gender,
                 منتج_المنافس=best["name"], معرف_المنافس=best.get("product_id",""),
-                سعر_المنافس=cp, الفرق=diff, نسبة_التطابق=score, ثقة_AI=ai_lbl,
+                سعر_المنافس=cp, الفرق=diff, match_score=score, ثقة_AI=ai_lbl,
                 القرار=dec, الخطورة=risk, المنافس=best.get("competitor",""),
                 عدد_المنافسين=len({c.get("competitor","") for c in ac}),
                 جميع_المنافسين=ac, مصدر_المطابقة=src or "fuzzy",
@@ -1202,10 +1202,10 @@ def run_full_analysis(our_df, comp_dfs, progress_callback=None, use_ai=True):
     # نحتفظ بالنسخة ذات نسبة التطابق الأعلى فقط
     if results:
         final_df = pd.DataFrame(results)
-        if "معرف_المنتج" in final_df.columns and "نسبة_التطابق" in final_df.columns:
+        if "معرف_المنتج" in final_df.columns and "match_score" in final_df.columns:
             # تحويل نسبة التطابق لأرقام
             final_df["_score_num"] = pd.to_numeric(
-                final_df["نسبة_التطابق"], errors="coerce"
+                final_df["match_score"], errors="coerce"
             ).fillna(0)
             # لكل معرف، احتفظ بأعلى تطابق
             id_col = "معرف_المنتج"
