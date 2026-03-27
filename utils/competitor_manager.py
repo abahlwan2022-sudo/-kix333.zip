@@ -1,6 +1,9 @@
 import json
 import os
 import threading
+import subprocess
+import sys
+import time
 
 import pandas as pd
 import streamlit as st
@@ -176,24 +179,105 @@ def render_competitor_scrape_page():  # noqa: C901
         with c3:
             st.caption(f"Sitemap: `{prog.get('current_sitemap', '—')}`")
 
-    def _run_scraper_bg() -> None:
-        import asyncio
+    # تحقق من وجود كتالوج مهووس قبل السماح بالكشط
+    our_df = getattr(st.session_state, "our_df", None)
+    has_store = isinstance(our_df, pd.DataFrame) and not our_df.empty
+    if not has_store:
+        st.error("⚠️ يرجى رفع ملف متجر مهووس الأساسي أولاً لتتم المقارنة التلقائية.")
 
-        from utils.async_scraper import run_scraper_engine
-
-        asyncio.run(run_scraper_engine())
-
-    col_btn, _ = st.columns([1, 2])
+    col_btn, col_live = st.columns([1, 2])
     with col_btn:
-        start_disabled = prog_running
+        start_disabled = prog_running or not has_store
         if st.button(
             "🚀 بدء جلب بيانات المنافسين الآن",
             use_container_width=True,
             disabled=start_disabled,
             key="btn_start_scrape_page",
         ):
-            threading.Thread(target=_run_scraper_bg, daemon=True).start()
-            st.rerun()
+            # تشغيل الكاشط في عملية خلفية غير حاجبة
+            cmd = [sys.executable, "-m", "utils.async_scraper"]
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                st.session_state["scraper_pid"] = proc.pid
+            except Exception as e:
+                st.error(f"تعذر تشغيل الكاشط الخلفي: {e}")
+            else:
+                st.success("✅ تم تشغيل محرك الكشط في الخلفية. سيتم تحديث النتائج تلقائياً أدناه.")
+
+    # عرض مباشر للمنتجات الجديدة/المفقودة مقارنة بكتالوج مهووس
+    live_placeholder = col_live.empty()
+    status_placeholder = col_live.empty()
+
+    def _live_auto_compare_once() -> None:
+        data_path = os.path.join(os.getcwd(), "data", "competitors_latest.csv")
+        if not (has_store and os.path.exists(data_path)):
+            return
+        try:
+            df_comp = pd.read_csv(data_path)
+        except Exception:
+            return
+        if df_comp.empty:
+            return
+
+        d = df_comp.copy()
+        # توحيد الأعمدة
+        col_map = {
+            "name": "الاسم",
+            "price": "السعر",
+            "brand": "الماركة",
+            "image_url": "رابط_الصورة",
+            "comp_image_url": "رابط_الصورة",
+            "comp_url": "رابط_المنتج",
+            "url": "رابط_المنتج",
+        }
+        for en, ar in col_map.items():
+            if en in d.columns and ar not in d.columns:
+                d[ar] = d[en]
+        if "sku" not in d.columns:
+            d["sku"] = ""
+
+        # مجموعات كتالوج مهووس (SKU + name)
+        our = our_df.copy() if has_store else pd.DataFrame()
+        our_skus = set(
+            our.get("sku", pd.Series(dtype=str)).astype(str).str.strip().tolist()
+        )
+        our_names = set(
+            our.get("name", our.get("product_name", pd.Series(dtype=str)))
+            .astype(str)
+            .str.strip()
+            .tolist()
+        )
+
+        d["__sku"] = d["sku"].astype(str).str.strip()
+        d["__name"] = d["الاسم"].astype(str).str.strip()
+        missing_mask = (~d["__sku"].isin(our_skus)) & (~d["__name"].isin(our_names))
+        missing_df = d.loc[missing_mask].copy()
+        if missing_df.empty:
+            status_placeholder.info("لا توجد منتجات مفقودة جديدة حالياً مقارنة بكتالوج مهووس.")
+            return
+
+        table_cols = ["الاسم", "السعر", "الماركة", "رابط_الصورة", "رابط_المنتج", "sku"]
+        for c in table_cols:
+            if c not in missing_df.columns:
+                missing_df[c] = ""
+        missing_df = missing_df[table_cols]
+        status_placeholder.success(
+            f"🔍 منتجات مفقودة/جديدة حالياً مقارنة بكتالوج مهووس: {len(missing_df)}"
+        )
+        live_placeholder.dataframe(
+            missing_df,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    # Polling خفيف كل بضع ثواني عند فتح الصفحة (بدون حظر واجهة المستخدم كلياً)
+    # ملاحظة: Streamlit سيعيد تشغيل الكود عند أي تفاعل، لذلك يكفي تشغيل المراقبة مرة واحدة لكل تحميل.
+    if has_store:
+        _live_auto_compare_once()
 
     meta_path = os.path.join(os.getcwd(), "data", "scraper_last_run.json")
     if os.path.exists(meta_path):
