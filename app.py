@@ -272,6 +272,86 @@ def _restore_results_from_json(results_list):
     return restored
 
 
+def _auto_refresh_results_from_background_files() -> bool:
+    """
+    يوزّع المنتجات تلقائياً من ملفات الخلفية الجاهزة (بدون رفع يدوي):
+    - data/final_priced_latest.csv
+    - data/competitors_latest.csv (لاستخراج مفقودات إضافية)
+    """
+    priced_path = os.path.join(os.getcwd(), "data", "final_priced_latest.csv")
+    if not os.path.exists(priced_path):
+        return False
+    try:
+        work = pd.read_csv(priced_path)
+        if work is None or work.empty:
+            return False
+        for c in ("price", "comp_price", "suggested_price", "match_score"):
+            if c not in work.columns:
+                work[c] = 0.0
+            work[c] = pd.to_numeric(work[c], errors="coerce").fillna(0.0)
+        if "status" not in work.columns:
+            work["status"] = ""
+        work["status"] = work["status"].fillna("").astype(str)
+
+        group_key_col = "sku" if "sku" in work.columns else "name"
+        work["_group_key"] = work[group_key_col].astype(str).fillna("").str.strip()
+        work.loc[work["_group_key"].isin(["", "N/A", "nan", "None"]), "_group_key"] = (
+            work.get("name", pd.Series(["N/A"] * len(work), index=work.index)).astype(str).str.strip()
+        )
+        work["min_comp_price"] = work.groupby("_group_key", dropna=False)["comp_price"].transform("min")
+        work["min_comp_price"] = pd.to_numeric(work["min_comp_price"], errors="coerce").fillna(0.0)
+
+        rel_diff = (
+            (work["price"] - work["min_comp_price"]).abs()
+            / work["min_comp_price"].replace(0, pd.NA)
+        ).fillna(999.0)
+        status_l = work["status"].str.lower()
+        valid_comp = work["min_comp_price"] > 0
+        mask_missing = status_l.eq("missing_after_verification")
+        mask_processed = status_l.eq("sent_to_make")
+        mask_review = (~mask_missing) & (status_l.isin({"processing", "under_review"}) | (work["match_score"] < 80))
+        mask_higher = (~mask_missing & ~mask_processed & ~mask_review & valid_comp & (work["price"] > work["min_comp_price"]))
+        mask_lower = (~mask_missing & ~mask_processed & ~mask_review & valid_comp & (work["price"] < work["min_comp_price"]))
+        mask_approved = (~mask_missing & ~mask_processed & ~mask_review & valid_comp & (rel_diff <= 0.02))
+
+        missing_df = work[mask_missing].copy()
+        comp_csv = os.path.join(os.getcwd(), "data", "competitors_latest.csv")
+        if os.path.exists(comp_csv):
+            comp_raw = pd.read_csv(comp_csv)
+            rename_map = {"الاسم": "name", "sku": "sku"}
+            for k, v in rename_map.items():
+                if k in comp_raw.columns and v not in comp_raw.columns:
+                    comp_raw[v] = comp_raw[k]
+            if "name" not in comp_raw.columns:
+                comp_raw["name"] = ""
+            if "sku" not in comp_raw.columns:
+                comp_raw["sku"] = ""
+            mah_skus = set(work.get("sku", pd.Series(dtype=str)).astype(str).str.strip().tolist())
+            mah_names = set(work.get("name", pd.Series(dtype=str)).astype(str).str.strip().tolist())
+            miss_mask = (~comp_raw["sku"].astype(str).str.strip().isin(mah_skus)) & (
+                ~comp_raw["name"].astype(str).str.strip().isin(mah_names)
+            )
+            more_missing = comp_raw.loc[miss_mask].copy()
+            if not more_missing.empty:
+                more_missing["is_missing"] = True
+                missing_df = pd.concat([missing_df, more_missing], ignore_index=True, sort=False)
+
+        auto_results = {
+            "price_raise": work[mask_higher].copy(),
+            "price_lower": work[mask_lower].copy(),
+            "approved": work[mask_approved].copy(),
+            "review": work[mask_review].copy(),
+            "missing": missing_df,
+            "all": work.copy(),
+        }
+        st.session_state.results = auto_results
+        st.session_state.analysis_df = work.copy()
+        st.session_state.final_priced_df = work.copy()
+        return True
+    except Exception:
+        return False
+
+
 # ── تحميل تلقائي للنتائج المحفوظة عند فتح التطبيق ──
 # ملاحظة: لا تستخدم `if results:` لأن [] تُعتبر False وتمنع الاستعادة رغم أن الحفظ نجح
 if st.session_state.results is None and not st.session_state.job_running:
@@ -285,6 +365,8 @@ if st.session_state.results is None and not st.session_state.job_running:
         st.session_state.results     = _auto_r
         st.session_state.analysis_df = _auto_df
         st.session_state.job_id      = _auto_job.get("job_id")
+    else:
+        _auto_refresh_results_from_background_files()
 
 
 # ── دوال مساعدة ───────────────────────────
@@ -1210,6 +1292,13 @@ if page == "📊 لوحة التحكم":
     st.header("📊 لوحة التحكم")
     st.caption("تم دمج عرض لوحة التسعير داخل لوحة التحكم لتفادي التكرار في القائمة الجانبية.")
     db_log("dashboard", "view")
+    # تحديث تلقائي مباشر من ملفات الخلفية كل 12 ثانية
+    try:
+        from streamlit_autorefresh import st_autorefresh
+        st_autorefresh(interval=12000, key="dashboard_auto_refresh_background")
+    except Exception:
+        pass
+    _auto_refresh_results_from_background_files()
 
     # ── بانر صحة النظام ────────────────────────────────────────────────────
     from engines.ai_engine import get_last_errors
