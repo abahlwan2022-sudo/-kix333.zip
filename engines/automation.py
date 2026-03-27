@@ -134,7 +134,7 @@ class AutomationEngine:
         decisions = []
         total = len(products_df)
         for idx, (_, row) in enumerate(products_df.iterrows()):
-            match_score = float(row.get("نسبة_التطابق", 0) or 0)
+            match_score = float(row.get("match_score", 0) or 0)
             # ✅ حماية من القرارات الخاطئة
             if match_score < 85:
                 if progress_callback:

@@ -159,6 +159,8 @@ PAGE_PROMPTS = {
 لكل منتج: 1.هل هو حقيقي وموثوق؟ 2.هل يستحق الاضافة؟ 3.السعر المقترح. 4.اولوية الاضافة (عالية/متوسطة/منخفضة). اجب بالعربية.""",
 "review": """انت خبير تسعير عطور. هذه منتجات بمطابقة غير مؤكدة.
 لكل منتج: هل هما نفس العطر فعلا؟ نعم / لا / غير متاكد. اشرح السبب. اجب بالعربية.""",
+"extract": """أنت خبير بيانات عطور صارم. اتبع تعليمات المستخدم فقط.
+أجب بـ JSON صالح فقط دون أي نص قبله أو بعده أو markdown أو ```.""",
 "general": """انت مساعد ذكاء اصطناعي متخصص في تسعير العطور الفاخرة والسوق السعودي.
 خبرتك: تحليل الاسعار، المنافسة، استراتيجيات التسعير، مكونات العطور.
 اجب بالعربية باحترافية وايجاز يمكنك استخدام markdown.""",
@@ -229,7 +231,7 @@ def _call_gemini(prompt, system="", grounding=False, temperature=0.3, max_tokens
             _log_err("Gemini", f"مفتاح {i+1}: {str(e)[:80]}")
     return None
 
-def _call_openrouter(prompt, system=""):
+def _call_openrouter(prompt, system="", temperature=0.3):
     if not OPENROUTER_API_KEY:
         return None
 
@@ -253,7 +255,7 @@ def _call_openrouter(prompt, system=""):
             r = requests.post(_OR, json={
                 "model": model,
                 "messages": msgs,
-                "temperature": 0.3,
+                "temperature": temperature,
                 "max_tokens": 8192
             }, headers={
                 "Authorization": f"Bearer {OPENROUTER_API_KEY}",
@@ -295,7 +297,7 @@ def _call_openrouter(prompt, system=""):
 
     return None
 
-def _call_cohere(prompt, system=""):
+def _call_cohere(prompt, system="", temperature=0.3):
     """
     Cohere — Fallback صامت فقط.
     أي خطأ (401/402/429/...) يُسجَّل ويُعاد None بدون إيقاف سير العمل.
@@ -310,7 +312,7 @@ def _call_cohere(prompt, system=""):
 
         r = requests.post(
             "https://api.cohere.com/v2/chat",
-            json={"model": "command-r-plus", "messages": messages, "temperature": 0.3},
+            json={"model": "command-r-plus", "messages": messages, "temperature": temperature},
             headers={"Authorization": f"Bearer {COHERE_API_KEY}",
                      "Content-Type": "application/json"},
             timeout=30
@@ -364,12 +366,12 @@ def _search_ddg(query, num_results=5):
     except: pass
     return []
 
-def call_ai(prompt, page="general"):
+def call_ai(prompt, page="general", temperature=0.3):
     sys = PAGE_PROMPTS.get(page, PAGE_PROMPTS["general"])
     for fn, src in [
-        (lambda: _call_gemini(prompt, sys), "Gemini"),
-        (lambda: _call_openrouter(prompt, sys), "OpenRouter"),
-        (lambda: _call_cohere(prompt, sys), "Cohere")
+        (lambda: _call_gemini(prompt, sys, temperature=temperature), "Gemini"),
+        (lambda: _call_openrouter(prompt, sys, temperature=temperature), "OpenRouter"),
+        (lambda: _call_cohere(prompt, sys, temperature=temperature), "Cohere")
     ]:
         r = fn()
         if r: return {"success":True,"response":r,"source":src}
@@ -809,6 +811,44 @@ def analyze_paste(text, context=""):
 
 # ══ دوال متوافقة مع app.py ════════════════════════════════════════════════
 def chat_with_ai(msg, history=None, ctx=""): return gemini_chat(msg, history, ctx)
-def analyze_product(p, price=0): return call_ai(f"حلل: {p} ({price:.0f}ريال)", "general")
+def analyze_product(product_name: str, brand: str = "") -> dict:
+    """
+    استخراج حقول منظمة من اسم المنتج — درجة حرارة 0.0 لتقليل التخمين.
+    يُرجع dict من JSON أو {"error", "raw"} عند الفشل.
+    """
+    prompt = f"""أنت خبير بيانات عطور صارم. حلل المنتج التالي واستخرج البيانات بصيغة JSON فقط. لا تخمن أبداً. إذا لم تجد المعلومة اكتب null.
+المنتج: {product_name}
+الماركة: {brand if brand else "null"}
+
+يجب أن يكون الرد بهذا الهيكل فقط (قيم boolean صالحة: true أو false فقط):
+{{
+    "brand": "اسم الماركة بالإنجليزية فقط",
+    "core_name": "اسم العطر بدون الماركة أو الحجم أو التركيز",
+    "concentration": "التركيز (PARFUM, EDP, EDT, EDC, MIST, HAIR_MIST) أو null",
+    "size_ml": "الحجم بالأرقام فقط أو null",
+    "gender": "الجنس (MALE, FEMALE, UNISEX) أو null",
+    "release_year": "سنة الإصدار إذا ذكرت صراحة (مثال: 2020) أو null",
+    "is_tester": false,
+    "is_set": false
+}}"""
+
+    res = call_ai(prompt, page="extract", temperature=0.0)
+    response_text = ""
+    if isinstance(res, dict) and res.get("success"):
+        response_text = (res.get("response") or "").strip()
+    elif isinstance(res, dict):
+        response_text = (res.get("response") or "").strip()
+
+    if not response_text:
+        return {"error": "AI Failed", "raw": ""}
+
+    try:
+        clean_text = response_text.replace("```json", "").replace("```", "").strip()
+        return json.loads(clean_text)
+    except Exception:
+        parsed = _parse_json(response_text)
+        if parsed:
+            return parsed
+        return {"error": "Parsing Failed", "raw": response_text}
 def suggest_price(p, comp_price): return call_ai(f"اقترح سعرا لـ {p} بدلا من {comp_price:.0f}ريال", "general")
 def process_paste(text): return analyze_paste(text)

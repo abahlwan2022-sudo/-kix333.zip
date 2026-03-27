@@ -293,23 +293,86 @@ def _cset(k, v):
 
 _init_db()
 
+
+def _score_csv_decoding(df):
+    """
+    يقيّم جودة فك الترميز: يفضّل أعمدة/عينات فيها عربي مقروء ويعاقب رمز الاستبدال U+FFFD.
+    يمنع اختيار latin-1 الخاطئ لملفات UTF-8 العربية (أسماء تحتوي ألف/همزات).
+    """
+    if df is None or len(df) == 0:
+        return -10_000
+    score = 0
+    for c in list(df.columns)[:12]:
+        t = str(c)
+        if "\ufffd" in t:
+            score -= 500
+        score += sum(1 for ch in t if "\u0600" <= ch <= "\u06ff") * 3
+    for col in list(df.columns)[:8]:
+        try:
+            sample = df[col].dropna().astype(str).head(100)
+            blob = " ".join(sample.tolist())
+        except Exception:
+            continue
+        if "\ufffd" in blob:
+            score -= 200
+        score += min(sum(1 for ch in blob if "\u0600" <= ch <= "\u06ff"), 400)
+    score += min(len(df), 50_000) // 100
+    return score
+
+
 # ─── دوال أساسية ────────────────────────────
-def read_file(f):
+def read_file(f, preview_rows=None):
+    """
+    قراءة CSV/Excel. إذا مُرّر preview_rows (عدد صفوف) يُقرأ الجزء الأول فقط —
+    مفيد لعرض أعمدة الملف دون تحميل الملف بالكامل.
+    """
     try:
         name = f.name.lower()
         df = None
+        csv_kw = {}
+        if preview_rows is not None:
+            csv_kw["nrows"] = int(preview_rows)
         if name.endswith('.csv'):
-            for enc in ['utf-8-sig','utf-8','windows-1256','cp1256','latin-1']:
+            best_df, best_sc = None, -10_000
+            encodings = [
+                "utf-8-sig", "utf-8", "utf-16", "utf-16-le", "utf-16-be",
+                "windows-1256", "cp1256", "iso-8859-6", "mac_arabic",
+                "cp720", "latin-1",
+            ]
+            for enc in encodings:
                 try:
                     f.seek(0)
-                    df = pd.read_csv(f, encoding=enc, on_bad_lines='skip')
-                    if len(df) > 0 and not df.columns[0].startswith('\ufeff'): 
-                        break
-                except: continue
+                    cand = pd.read_csv(
+                        f,
+                        encoding=enc,
+                        on_bad_lines="skip",
+                        low_memory=False,
+                        **csv_kw,
+                    )
+                    if cand is None or len(cand) == 0:
+                        continue
+                    cand = cand.copy()
+                    cand.columns = cand.columns.astype(str).str.strip().str.replace(
+                        "\ufeff", "", regex=False
+                    )
+                    sc = _score_csv_decoding(cand)
+                    if sc > best_sc:
+                        best_sc, best_df = sc, cand
+                except Exception:
+                    continue
+            df = best_df
             if df is None:
-                return None, "فشل قراءة الملف بجميع الترميزات"
-        elif name.endswith(('.xlsx','.xls')):
-            df = pd.read_excel(f)
+                return None, "فشل قراءة الملف بجميع الترميزات (جرب حفظ CSV كـ UTF-8 مع BOM)"
+        elif name.endswith(".xlsx"):
+            if preview_rows is not None:
+                df = pd.read_excel(f, engine="openpyxl", nrows=int(preview_rows))
+            else:
+                df = pd.read_excel(f, engine="openpyxl")
+        elif name.endswith(".xls"):
+            if preview_rows is not None:
+                df = pd.read_excel(f, nrows=int(preview_rows))
+            else:
+                df = pd.read_excel(f)
         else:
             return None, "صيغة غير مدعومة"
         # تنظيف أسماء الأعمدة من BOM والمسافات
@@ -479,16 +542,6 @@ def extract_type(text):
     if "edc" in n: return "EDC"
     return ""
 
-def extract_gender(text):
-    if not isinstance(text, str): return ""
-    tl = text.lower()
-    # تم التحديث ليشمل mans وصيغ الرجال المطلوبة
-    m = any(k in tl for k in ["pour homme","for men"," men "," man ","رجالي","للرجال"," مان "," هوم ","homme"," uomo", "mans", "for mans", " mans "])
-    w = any(k in tl for k in ["pour femme","for women","women"," woman ","نسائي","للنساء","النسائي","lady","femme"," donna"])
-    if m and not w: return "رجالي"
-    if w and not m: return "نسائي"
-    return ""
-
 def extract_product_line(text, brand=""):
     """استخراج اسم خط الإنتاج (المنتج الأساسي) بعد إزالة الماركة والكلمات الشائعة.
     مثال: 'عطر بربري هيرو أو دو تواليت 100مل' → 'هيرو'
@@ -649,6 +702,58 @@ def _fcol(df, cands):
             if c in col or _norm_ar(c) in _norm_ar(col):
                 return col
     return cols[0] if cols else ""
+
+_OUR_NAME_CANDS = ["المنتج", "اسم المنتج", "Product", "Name", "name"]
+_OUR_PRICE_CANDS = ["سعر المنتج", "السعر", "سعر", "Price", "price", "PRICE"]
+_OUR_ID_CANDS = [
+    "رقم المنتج", "معرف المنتج", "المعرف", "معرف", "رقم_المنتج", "معرف_المنتج",
+    "product_id", "Product ID", "Product_ID", "ID", "id", "Id",
+    "SKU", "sku", "Sku", "رمز المنتج", "رمز_المنتج", "رمز المنتج sku",
+    "الكود", "كود", "Code", "code", "الرقم", "رقم", "Barcode", "barcode", "الباركود",
+]
+
+
+def guess_default_columns(df):
+    """تخمين أعمدة الاسم / السعر / المعرّف لملف مرفوع (قبل التعيين اليدوي)."""
+    if df is None or len(df.columns) == 0:
+        return None, None, None
+    cols = list(df.columns)
+    n = _fcol(df, _OUR_NAME_CANDS)
+    p = _fcol(df, _OUR_PRICE_CANDS)
+    i = _fcol(df, _OUR_ID_CANDS)
+    if n == p and len(cols) > 1:
+        for c in cols:
+            if c == n:
+                continue
+            try:
+                float(str(df[c].dropna().iloc[0]).replace(",", ""))
+                p = c
+                break
+            except Exception:
+                pass
+    if i == n or i == p:
+        i = None
+    return n, p, i
+
+
+def apply_column_mapping(df, name_col, price_col, id_col=None):
+    """
+    إعادة تسمية الأعمدة المختارة إلى المعيار الداخلي:
+    اسم المنتج، السعر، رقم المنتج — ليتعرّف عليها المحرك والكتالوج.
+    """
+    if df is None or len(df) == 0:
+        return df
+    out = df.copy()
+    rename = {}
+    if name_col and name_col in out.columns:
+        rename[name_col] = "اسم المنتج"
+    if price_col and price_col in out.columns and price_col != name_col:
+        rename[price_col] = "السعر"
+    if id_col and str(id_col).strip() and id_col in out.columns:
+        if id_col not in (name_col, price_col):
+            rename[id_col] = "رقم المنتج"
+    return out.rename(columns=rename)
+
 
 # ═══════════════════════════════════════════════════════
 #  الكلاس الجديد: Pre-normalized Competitor Index
@@ -997,7 +1102,7 @@ def _row(product, our_price, our_id, brand, size, ptype, gender,
         return dict(المنتج=product, معرف_المنتج=our_id, السعر=our_price,
                     الماركة=brand, الحجم=sz_str, النوع=ptype, الجنس=gender,
                     منتج_المنافس="—", معرف_المنافس="", سعر_المنافس=0,
-                    الفرق=0, نسبة_التطابق=0, ثقة_AI="—",
+                    الفرق=0, match_score=0, ثقة_AI="—",
                     القرار=override or "🔍 منتجات مفقودة",
                     الخطورة="", المنافس="", عدد_المنافسين=0,
                     جميع_المنافسين=[], مصدر_المطابقة=src or "—",
@@ -1048,7 +1153,7 @@ def _row(product, our_price, our_id, brand, size, ptype, gender,
     return dict(المنتج=product, معرف_المنتج=our_id, السعر=our_price,
                 الماركة=brand, الحجم=sz_str, النوع=ptype, الجنس=gender,
                 منتج_المنافس=best["name"], معرف_المنافس=best.get("product_id",""),
-                سعر_المنافس=cp, الفرق=diff, نسبة_التطابق=score, ثقة_AI=ai_lbl,
+                سعر_المنافس=cp, الفرق=diff, match_score=score, ثقة_AI=ai_lbl,
                 القرار=dec, الخطورة=risk, المنافس=best.get("competitor",""),
                 عدد_المنافسين=len({c.get("competitor","") for c in ac}),
                 جميع_المنافسين=ac, مصدر_المطابقة=src or "fuzzy",
@@ -1202,10 +1307,10 @@ def run_full_analysis(our_df, comp_dfs, progress_callback=None, use_ai=True):
     # نحتفظ بالنسخة ذات نسبة التطابق الأعلى فقط
     if results:
         final_df = pd.DataFrame(results)
-        if "معرف_المنتج" in final_df.columns and "نسبة_التطابق" in final_df.columns:
+        if "معرف_المنتج" in final_df.columns and "match_score" in final_df.columns:
             # تحويل نسبة التطابق لأرقام
             final_df["_score_num"] = pd.to_numeric(
-                final_df["نسبة_التطابق"], errors="coerce"
+                final_df["match_score"], errors="coerce"
             ).fillna(0)
             # لكل معرف، احتفظ بأعلى تطابق
             id_col = "معرف_المنتج"
@@ -1392,6 +1497,29 @@ def _v12_core_name(raw_name: str, brand: str = "") -> str:
     return text
 
 
+def extract_year(text: str) -> str:
+    m = re.search(r"\b(19\d{2}|20\d{2})\b", str(text))
+    return m.group(1) if m else ""
+
+
+def extract_gender(text: str) -> str:
+    """MALE / FEMALE / UNISEX / UNKNOWN — إنجليزي بـ \\b، عربي بحدود مسافة/نص."""
+    text_lower = str(text).lower()
+    if re.search(r"\b(men|homme|pour homme)\b", text_lower):
+        return "MALE"
+    if re.search(r"\b(women|femme|pour femme)\b", text_lower):
+        return "FEMALE"
+    if re.search(r"\bunisex\b", text_lower):
+        return "UNISEX"
+    if re.search(r"(?:^|\s)(للرجال|رجالي)(?=\s|$)", text_lower):
+        return "MALE"
+    if re.search(r"(?:^|\s)(للنساء|نسائي)(?=\s|$)", text_lower):
+        return "FEMALE"
+    if re.search(r"(?:^|\s)(للجنسين|يونيسكس)(?=\s|$)", text_lower):
+        return "UNISEX"
+    return "UNKNOWN"
+
+
 @dataclass
 class _V12Product:
     raw_name: str
@@ -1402,6 +1530,8 @@ class _V12Product:
     core_name: str = ""
     is_sample_flag: bool = False
     brand_normalized: str = ""
+    year: str = ""
+    gender: str = "UNKNOWN"
 
     def __post_init__(self):
         self.size = _v12_extract_size(self.raw_name)
@@ -1410,6 +1540,8 @@ class _V12Product:
         self.is_sample_flag = _v12_is_sample(self.raw_name, self.size)
         self.core_name = _v12_core_name(self.raw_name, self.brand)
         self.brand_normalized = _v12_norm_brand(self.brand)
+        self.year = extract_year(self.raw_name)
+        self.gender = extract_gender(self.raw_name)
 
 
 class ClusterMatchEngine:
@@ -1455,6 +1587,12 @@ class ClusterMatchEngine:
         if (new_p.concentration != "UNKNOWN" and store_p.concentration != "UNKNOWN"
                 and new_p.concentration != store_p.concentration):
             return False, f"تركيز مختلف: {new_p.concentration} vs {store_p.concentration}", 0.0
+        if new_p.year and store_p.year and new_p.year != store_p.year:
+            return False, f"سنة مختلفة: {new_p.year} vs {store_p.year}", 0.0
+        if (new_p.gender != "UNKNOWN" and store_p.gender != "UNKNOWN"
+                and new_p.gender != store_p.gender):
+            if "UNISEX" not in (new_p.gender, store_p.gender):
+                return False, f"تعارض في الجنس: {new_p.gender} vs {store_p.gender}", 0.0
         score = self._name_sim(new_p.core_name, store_p.core_name)
         return True, "مؤهل", score
 
