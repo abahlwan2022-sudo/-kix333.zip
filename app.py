@@ -62,7 +62,7 @@ from utils.make_helper import (send_price_updates, send_new_products,
                                 send_batch_smart, build_pricing_sync_payload,
                                 bulk_sync_pricing_recommendations,
                                 is_pricing_webhook_configured)
-from utils.competitor_manager import render_competitor_management_ui
+from utils.competitor_manager import render_competitor_scrape_page
 from utils.db_manager import (init_db, log_event, log_decision,
                                log_analysis, get_events, get_decisions,
                                get_analysis_history, upsert_price_history,
@@ -945,8 +945,8 @@ with st.sidebar:
 
     st.markdown(
         '<p style="font-size:0.85rem;margin:8px 0;line-height:1.4;">'
-        "🏢 <b>إدارة المنافسين (Sitemap):</b> افتح القسم <b>⚙️ الإعدادات</b> "
-        "← التبويب <b>🏢 المنافسين (Sitemap)</b> لإضافة حتى <b>7</b> روابط اختبار."
+        "🏢 <b>كشط المنافسين:</b> افتح القسم <b>🏢 كشط المنافسين</b> لإضافة روابط Sitemap "
+        "وتشغيل الجلب مع عرض وحفظ تدريجي."
         "</p>",
         unsafe_allow_html=True,
     )
@@ -1206,10 +1206,18 @@ if page == "📊 لوحة التحكم":
 
 
 # ════════════════════════════════════════════════
-#  1b. لوحة التسعير — رؤى قابلة للتنفيذ
+#  1b. كشط المنافسين (Sitemap + CSV حي)
 # ════════════════════════════════════════════════
-elif page == "📊 لوحة التسعير (Dashboard)":
-    st.header("📊 لوحة التسعير (Dashboard)")
+elif page == "🏢 كشط المنافسين":
+    db_log("competitor_scrape", "view")
+    render_competitor_scrape_page()
+
+
+# ════════════════════════════════════════════════
+#  1c. لوحة التسعير — رؤى قابلة للتنفيذ
+# ════════════════════════════════════════════════
+elif page == "📊 لوحة التسعير":
+    st.header("📊 لوحة التسعير")
     st.caption("رؤى من بيانات التسعير المطابقة مع المنافس والسعر المقترح.")
     db_log("pricing_dashboard", "view")
 
@@ -2713,7 +2721,7 @@ elif page == "⚙️ الإعدادات":
     st.header("⚙️ الإعدادات")
     db_log("settings", "view")
 
-    tab1, tab2, tab3, tab4 = st.tabs(["🔑 المفاتيح", "⚙️ المطابقة", "📜 السجل", "🏢 المنافسين (Sitemap)"])
+    tab1, tab2, tab3 = st.tabs(["🔑 المفاتيح", "⚙️ المطابقة", "📜 السجل"])
 
     with tab1:
         # ── الحالة الحالية ────────────────────────────────────────────────
@@ -2839,89 +2847,11 @@ elif page == "⚙️ الإعدادات":
         else:
             st.info("لا توجد قرارات مسجلة")
 
-    with tab4:
-        render_competitor_management_ui()
-
-        import os
-        import pandas as pd
-        import asyncio
-        from utils.async_scraper import run_scraper_engine
-
-        st.markdown("---")
-        st.subheader("🤖 تشغيل محرك الكشط وعرض النتائج")
-        st.info("سيسحب هذا المحرك أحدث أسعار المنافسين بناءً على الروابط المدخلة ويعرضها فوراً.")
-
-        # 1. The Scraper Button
-        if st.button("🚀 بدء جلب بيانات المنافسين الآن", use_container_width=True):
-            with st.spinner("جاري اختراق الموقع وسحب البيانات... يرجى الانتظار."):
-                try:
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                    loop.run_until_complete(run_scraper_engine())
-                    st.success("✅ تمت عملية الكشط بنجاح!")
-                    # CRITICAL: Force Streamlit to refresh and read the newly created file
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"❌ حدث خطأ أثناء الكشط: {str(e)}")
-
-        # ملخص أداء آخر تشغيل (من scraper_last_run.json)
-        meta_path = os.path.join(os.getcwd(), "data", "scraper_last_run.json")
-        if os.path.exists(meta_path):
-            try:
-                import json as _json
-
-                with open(meta_path, "r", encoding="utf-8") as _mf:
-                    sm = _json.load(_mf)
-                st.markdown("### 📈 ملخص أداء آخر كشط")
-                st.caption(
-                    f"آخر تحديث (UTC): `{sm.get('finished_at', '—')}` · الحالة: **{sm.get('status', '—')}**"
-                )
-                c1, c2, c3, c4 = st.columns(4)
-                with c1:
-                    st.metric("روابط في الطابور", f"{sm.get('urls_queued', 0):,}")
-                with c2:
-                    st.metric("صفوف في CSV", f"{sm.get('rows_written_csv', 0):,}")
-                with c3:
-                    st.metric("نسبة النجاح", f"{sm.get('success_rate_pct', 0.0):.1f}%")
-                with c4:
-                    st.metric("المدة (ث)", f"{sm.get('duration_seconds', 0):.1f}")
-                c5, c6, c7 = st.columns(3)
-                with c5:
-                    st.metric("قبل إزالة التكرار", f"{sm.get('rows_extracted_before_dedupe', 0):,}")
-                with c6:
-                    st.metric("طلبات فاشلة (استثناء)", f"{sm.get('fetch_exceptions', 0):,}")
-                with c7:
-                    st.metric("بدون استخراج (فراغ)", f"{sm.get('parse_null', 0):,}")
-                diag = sm.get("sitemap_diagnostics") or []
-                if diag:
-                    with st.expander("🔎 تشخيص روابط الـ Sitemap (حالة HTTP وأخطاء الجلب)", expanded=False):
-                        st.dataframe(pd.DataFrame(diag), use_container_width=True, hide_index=True)
-                        st.caption(
-                            "إذا ظهرت حالة **410 Gone** أو **404** فالرابط لم يعد متاحاً على الخادم — "
-                            "استبدله برابط sitemap حديث من المتجر (أو من لوحة تحكم سلة/زد). "
-                            "جرّب فتح الرابط في المتصفح؛ يجب أن يظهر ملف XML وليس صفحة خطأ."
-                        )
-            except Exception:
-                pass
-
-        # 2. Persistent Data Viewer (Always visible if the file exists)
-        st.markdown("### 📊 البيانات المسحوبة من المنافسين")
-        data_path = os.path.join(os.getcwd(), "data", "competitors_latest.csv")
-
-        if os.path.exists(data_path):
-            try:
-                df_comp = pd.read_csv(data_path)
-                if df_comp.empty:
-                    st.warning(
-                        "⚠️ تمت عملية الكشط، ولكن الملف فارغ! تأكد أن رابط الـ Sitemap صحيح ويحتوي على منتجات."
-                    )
-                else:
-                    st.success(f"✅ تم العثور على {len(df_comp)} منتج مسحوب وجاهز للمطابقة.")
-                    st.dataframe(df_comp, use_container_width=True, height=400)
-            except Exception as e:
-                st.error(f"❌ حدث خطأ في قراءة ملف البيانات: {str(e)}")
-        else:
-            st.warning("⚠️ لا توجد أي بيانات مسحوبة حالياً. اضغط على زر الجلب أعلاه للبدء.")
+    st.markdown("---")
+    st.info(
+        "🏢 **كشط المنافسين و Sitemap:** انتقل إلى القسم **🏢 كشط المنافسين** في الشريط الجانبي "
+        "لإضافة الروابط وتشغيل الجلب مع عرض وحفظ تدريجي."
+    )
 
 
 # ════════════════════════════════════════════════
