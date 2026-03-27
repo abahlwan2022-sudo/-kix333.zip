@@ -1,8 +1,11 @@
 """
-Async competitor sitemap scraper — يقرأ روابط Sitemap من data/competitors_list.json
-ويُخرج data/competitors_latest.csv
+Continuous competitor scraper + resilient state.
 
-استخراج JSON-LD أولاً (Salla / Zid) ثم وسوم meta — أقل اعتماداً على CSS.
+Features:
+1) SQLite state (pending/completed/failed) with resume on restart/crash.
+2) Sitemap sync every 2 hours (discover new URLs without duplicates).
+3) Price-change prioritization in competitors_latest.csv (new/changed on top).
+4) Auto-trigger AI pricing pipeline in background after updated batches.
 """
 from __future__ import annotations
 
@@ -14,24 +17,36 @@ import os
 import random
 import re
 import shutil
+import sqlite3
 import time
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import aiohttp
 import pandas as pd
 from bs4 import BeautifulSoup
+from config import MAIN_STORE_DOMAIN, is_main_store_domain
+from utils.sitemap_resolve import resolve_sitemap_url_async
 
 logger = logging.getLogger(__name__)
 
-SCRAPER_LAST_RUN_JSON = os.path.join("data", "scraper_last_run.json")
-SCRAPER_PROGRESS_JSON = os.path.join("data", "scraper_progress.json")
+DATA_DIR = "data"
+SCRAPER_LAST_RUN_JSON = os.path.join(DATA_DIR, "scraper_last_run.json")
+SCRAPER_PROGRESS_JSON = os.path.join(DATA_DIR, "scraper_progress.json")
+STATE_DB_PATH = os.path.join(DATA_DIR, "scraper_state.db")
+COMPETITOR_CSV = os.path.join(DATA_DIR, "competitors_latest.csv")
+COMPETITOR_TMP_CSV = os.path.join(DATA_DIR, "competitors_temp.csv")
+COMPETITORS_FILE = os.path.join(DATA_DIR, "competitors_list.json")
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 def _write_scraper_last_run_meta(payload: Dict[str, Any]) -> None:
-    os.makedirs("data", exist_ok=True)
+    os.makedirs(DATA_DIR, exist_ok=True)
     with open(SCRAPER_LAST_RUN_JSON, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
@@ -45,36 +60,298 @@ def _merge_scraper_progress(updates: Dict[str, Any]) -> None:
         except Exception:
             pass
     prev.update(updates)
-    os.makedirs("data", exist_ok=True)
+    os.makedirs(DATA_DIR, exist_ok=True)
     with open(SCRAPER_PROGRESS_JSON, "w", encoding="utf-8") as f:
         json.dump(prev, f, ensure_ascii=False, indent=2)
 
 
-def _save_competitor_csv_rows(rows: List[Dict[str, Any]]) -> int:
-    """يكتب competitors_latest.csv من قائمة صفوف. يعيد عدد الصفوف بعد إزالة التكرار."""
-    if not rows:
+def _get_state_conn() -> sqlite3.Connection:
+    os.makedirs(DATA_DIR, exist_ok=True)
+    conn = sqlite3.connect(STATE_DB_PATH, check_same_thread=False, timeout=30)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA busy_timeout=30000;")
+    return conn
+
+
+def _init_state_db() -> None:
+    conn = _get_state_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS url_queue (
+            url TEXT PRIMARY KEY,
+            sitemap_url TEXT,
+            status TEXT NOT NULL DEFAULT 'pending',
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS product_state (
+            comp_url TEXT PRIMARY KEY,
+            name TEXT,
+            price REAL,
+            brand TEXT,
+            image_url TEXT,
+            sku TEXT,
+            competitor TEXT,
+            is_new INTEGER NOT NULL DEFAULT 1,
+            changed INTEGER NOT NULL DEFAULT 1,
+            last_changed_at TEXT,
+            last_seen_at TEXT NOT NULL
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS scraper_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+def _load_competitor_sitemaps() -> List[Dict[str, str]]:
+    if not os.path.exists(COMPETITORS_FILE):
+        return []
+    try:
+        with open(COMPETITORS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if not isinstance(data, list):
+                return []
+            out: List[Dict[str, str]] = []
+            for item in data:
+                if isinstance(item, dict):
+                    domain = str(item.get("domain", "")).strip()
+                    name = str(item.get("name", "")).strip() or domain
+                    if domain and not is_main_store_domain(domain):
+                        out.append({"name": name, "domain": domain})
+                elif isinstance(item, str):
+                    u = item.strip()
+                    if u and not is_main_store_domain(u):
+                        out.append({"name": u, "domain": u})
+            return out
+    except Exception:
+        return []
+
+
+def _insert_discovered_urls(sitemap_url: str, urls: List[str]) -> int:
+    if not urls:
         return 0
-    _col_order = ["name", "price", "brand", "image_url", "comp_url", "sku"]
-    df = pd.DataFrame(rows).drop_duplicates(subset=["comp_url"])
-    for c in _col_order:
-        if c not in df.columns:
-            df[c] = ""
-    df = df[_col_order]
-    temp_file = "data/competitors_temp.csv"
-    final_file = "data/competitors_latest.csv"
-    df_ar = df.rename(
+    now = _utc_now()
+    conn = _get_state_conn()
+    cur = conn.cursor()
+    inserted = 0
+    for u in urls:
+        cur.execute(
+            """
+            INSERT OR IGNORE INTO url_queue
+            (url, sitemap_url, status, attempt_count, last_error, created_at, updated_at, last_seen_at)
+            VALUES (?, ?, 'pending', 0, NULL, ?, ?, ?)
+            """,
+            (u, sitemap_url, now, now, now),
+        )
+        inserted += cur.rowcount
+        cur.execute(
+            "UPDATE url_queue SET last_seen_at=?, updated_at=? WHERE url=?",
+            (now, now, u),
+        )
+    conn.commit()
+    conn.close()
+    return inserted
+
+
+def _load_pending_urls(limit: int) -> List[str]:
+    conn = _get_state_conn()
+    rows = conn.execute(
+        """
+        SELECT url
+        FROM url_queue
+        WHERE status='pending'
+        ORDER BY updated_at ASC, created_at ASC
+        LIMIT ?
+        """,
+        (int(limit),),
+    ).fetchall()
+    conn.close()
+    return [str(r["url"]) for r in rows]
+
+
+def _mark_url_status(url: str, status: str, error: str = "") -> None:
+    now = _utc_now()
+    conn = _get_state_conn()
+    conn.execute(
+        """
+        UPDATE url_queue
+        SET status=?,
+            attempt_count=attempt_count+1,
+            last_error=?,
+            updated_at=?
+        WHERE url=?
+        """,
+        (status, error[:500], now, url),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _upsert_product_and_get_change(row: Dict[str, Any]) -> Tuple[bool, bool]:
+    """Returns (is_new_or_changed, inserted_new)."""
+    comp_url = str(row.get("comp_url", "")).strip()
+    if not comp_url:
+        return (False, False)
+
+    price = float(row.get("price", 0) or 0)
+    now = _utc_now()
+    competitor = urlparse(comp_url).netloc.lower()
+
+    conn = _get_state_conn()
+    prev = conn.execute(
+        """
+        SELECT price FROM product_state WHERE comp_url=?
+        """,
+        (comp_url,),
+    ).fetchone()
+
+    if prev is None:
+        conn.execute(
+            """
+            INSERT INTO product_state
+            (comp_url, name, price, brand, image_url, sku, competitor, is_new, changed, last_changed_at, last_seen_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 1, 1, ?, ?)
+            """,
+            (
+                comp_url,
+                str(row.get("name", "")),
+                price,
+                str(row.get("brand", "")),
+                str(row.get("image_url", "")),
+                str(row.get("sku", "")),
+                competitor,
+                now,
+                now,
+            ),
+        )
+        conn.commit()
+        conn.close()
+        return (True, True)
+
+    prev_price = float(prev["price"] or 0)
+    changed = abs(prev_price - price) > 1e-9
+    conn.execute(
+        """
+        UPDATE product_state
+        SET name=?,
+            price=?,
+            brand=?,
+            image_url=?,
+            sku=?,
+            competitor=?,
+            is_new=0,
+            changed=?,
+            last_changed_at=CASE WHEN ?=1 THEN ? ELSE last_changed_at END,
+            last_seen_at=?
+        WHERE comp_url=?
+        """,
+        (
+            str(row.get("name", "")),
+            price,
+            str(row.get("brand", "")),
+            str(row.get("image_url", "")),
+            str(row.get("sku", "")),
+            competitor,
+            1 if changed else 0,
+            1 if changed else 0,
+            now,
+            now,
+            comp_url,
+        ),
+    )
+    conn.commit()
+    conn.close()
+    return (changed, False)
+
+
+def _export_competitors_csv_prioritized() -> int:
+    conn = _get_state_conn()
+    rows = conn.execute(
+        """
+        SELECT
+            name,
+            price,
+            brand,
+            image_url,
+            comp_url,
+            sku,
+            is_new,
+            changed,
+            COALESCE(last_changed_at, last_seen_at) AS changed_ts,
+            last_seen_at
+        FROM product_state
+        ORDER BY
+            CASE WHEN is_new=1 OR changed=1 THEN 0 ELSE 1 END ASC,
+            changed_ts DESC,
+            last_seen_at DESC
+        """
+    ).fetchall()
+    conn.close()
+
+    if not rows:
+        if os.path.exists(COMPETITOR_CSV):
+            os.remove(COMPETITOR_CSV)
+        return 0
+
+    df = pd.DataFrame([dict(r) for r in rows])
+    out = df.rename(
         columns={
             "name": "الاسم",
             "price": "السعر",
             "brand": "الماركة",
             "image_url": "رابط_الصورة",
             "comp_url": "رابط_المنتج",
-            "sku": "sku",
         }
     )
-    df_ar.to_csv(temp_file, index=False, encoding="utf-8-sig")
-    shutil.move(temp_file, final_file)
-    return len(df)
+    out = out[["الاسم", "السعر", "الماركة", "رابط_الصورة", "رابط_المنتج", "sku"]]
+    out.to_csv(COMPETITOR_TMP_CSV, index=False, encoding="utf-8-sig")
+    shutil.move(COMPETITOR_TMP_CSV, COMPETITOR_CSV)
+    return len(out)
+
+
+def _get_queue_counters() -> Dict[str, int]:
+    conn = _get_state_conn()
+    rows = conn.execute(
+        "SELECT status, COUNT(*) AS cnt FROM url_queue GROUP BY status"
+    ).fetchall()
+    conn.close()
+    out = {"pending": 0, "completed": 0, "failed": 0}
+    for r in rows:
+        out[str(r["status"])] = int(r["cnt"])
+    return out
+
+
+async def _trigger_ai_pipeline_async(reason: str, changed_rows: int) -> None:
+    """Runs matcher + Gemini pricing engine in background after updates."""
+    if changed_rows <= 0:
+        return
+    try:
+        from utils.pricing_pipeline import run_auto_pricing_pipeline_background
+
+        await asyncio.to_thread(
+            run_auto_pricing_pipeline_background,
+            reason=reason,
+            changed_rows=changed_rows,
+        )
+    except Exception as e:
+        logger.error("Auto pipeline trigger failed: %s", e)
 
 
 def _tag_local(tag: str) -> str:
@@ -347,6 +624,7 @@ class AsyncCompetitorScraper:
             "price": price_out,
             "brand": brand,
             "image_url": image_url,
+            "comp_image_url": image_url,
             "comp_url": url,
             "sku": sku,
         }
@@ -383,6 +661,7 @@ class AsyncCompetitorScraper:
             "price": float(price),
             "brand": "",
             "image_url": image_url,
+            "comp_image_url": image_url,
             "comp_url": url,
             "sku": _stable_sku_from_url(url),
         }
@@ -465,6 +744,7 @@ class AsyncCompetitorScraper:
                                 "price": float(p),
                                 "brand": "",
                                 "image_url": image_url,
+                                "comp_image_url": image_url,
                                 "comp_url": url,
                                 "sku": _stable_sku_from_url(url),
                             }
@@ -474,218 +754,267 @@ class AsyncCompetitorScraper:
             return None
 
 
-async def run_scraper_engine() -> None:
-    """المحرك الرئيسي الذي يشغل العملية بالكامل ويقرأ من JSON.
-    يحدّث `competitors_latest.csv` و `scraper_progress.json` بعد كل دفعة جلب."""
-    logger.info("Starting High-Speed Async Scraper Engine...")
-    t0 = time.perf_counter()
-    finished_at = datetime.now(timezone.utc).isoformat()
-
-    competitors_file = "data/competitors_list.json"
-    competitor_sitemaps: List[str] = []
-
-    if os.path.exists(competitors_file):
-        try:
-            with open(competitors_file, "r", encoding="utf-8") as f:
-                competitor_sitemaps = json.load(f)
-        except Exception as e:
-            logger.error("Failed to load competitors JSON: %s", e)
-
-    if not competitor_sitemaps:
-        logger.info("No sitemaps found in config. Please add them via the UI. Exiting.")
-        _merge_scraper_progress(
+async def _sync_sitemaps_once(
+    session: aiohttp.ClientSession, scraper: AsyncCompetitorScraper
+) -> List[Dict[str, Any]]:
+    competitors = _load_competitor_sitemaps()
+    diagnostics: List[Dict[str, Any]] = []
+    if not competitors:
+        diagnostics.append(
             {
-                "running": False,
-                "finished_at": finished_at,
-                "last_error": None,
+                "competitor": "guard",
+                "domain": MAIN_STORE_DOMAIN,
+                "sitemap": None,
+                "urls_found": 0,
+                "urls_product_pages": 0,
+                "new_pending_added": 0,
+                "http_status": None,
+                "fetch_error": "no_competitors_or_main_store_filtered",
+                "parse_error": None,
             }
         )
-        _write_scraper_last_run_meta(
+    for c in competitors:
+        comp_name = c.get("name", "")
+        domain = c.get("domain", "")
+        sitemap = await resolve_sitemap_url_async(domain)
+        if not sitemap:
+            diagnostics.append(
+                {
+                    "competitor": comp_name,
+                    "domain": domain,
+                    "sitemap": None,
+                    "urls_found": 0,
+                    "urls_product_pages": 0,
+                    "new_pending_added": 0,
+                    "http_status": None,
+                    "fetch_error": "sitemap_not_found",
+                    "parse_error": None,
+                }
+            )
+            continue
+        urls, diag = await scraper.scan_sitemap(session, sitemap)
+        raw_len = len(urls)
+        urls = _filter_salla_like_product_urls(urls)
+        inserted = _insert_discovered_urls(sitemap, urls)
+        diagnostics.append(
             {
-                "status": "no_sitemaps",
-                "finished_at": finished_at,
-                "duration_seconds": round(time.perf_counter() - t0, 2),
-                "sitemaps_count": 0,
-                "urls_queued": 0,
-                "rows_extracted_before_dedupe": 0,
-                "rows_written_csv": 0,
-                "fetch_exceptions": 0,
-                "parse_null": 0,
-                "success_rate_pct": 0.0,
-                "sitemap_diagnostics": [],
+                "competitor": comp_name,
+                "domain": domain,
+                "sitemap": sitemap,
+                "urls_found": raw_len,
+                "urls_product_pages": len(urls),
+                "new_pending_added": inserted,
+                "http_status": diag.get("http_status"),
+                "fetch_error": diag.get("fetch_error"),
+                "parse_error": diag.get("parse_error"),
             }
         )
-        return
+    return diagnostics
 
-    scraper = AsyncCompetitorScraper(concurrency_limit=15)
-    all_results: List[Dict[str, Any]] = []
-    urls_queued = 0
-    urls_processed_total = 0
-    fetch_exceptions = 0
+
+async def _process_pending_batch(
+    session: aiohttp.ClientSession,
+    scraper: AsyncCompetitorScraper,
+    batch_size: int,
+) -> Dict[str, int]:
+    pending_urls = _load_pending_urls(batch_size)
+    if not pending_urls:
+        return {"queued": 0, "processed": 0, "updated_rows": 0, "failed": 0, "null": 0}
+
+    tasks = [scraper.fetch_and_parse_url(session, u) for u in pending_urls]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    updated_rows = 0
+    failed = 0
     parse_null = 0
-    sitemap_diagnostics: List[Dict[str, Any]] = []
-    started = datetime.now(timezone.utc).isoformat()
+    for url, res in zip(pending_urls, results):
+        if isinstance(res, Exception):
+            _mark_url_status(url, "failed", str(res))
+            failed += 1
+            continue
+        if res is None:
+            _mark_url_status(url, "failed", "extract_null")
+            parse_null += 1
+            continue
+        changed, _is_new = _upsert_product_and_get_change(res)
+        _mark_url_status(url, "completed", "")
+        if changed:
+            updated_rows += 1
+
+    rows_in_csv = _export_competitors_csv_prioritized()
     _merge_scraper_progress(
         {
             "running": True,
-            "started_at": started,
+            "rows_in_csv": rows_in_csv,
+            "urls_processed": _get_queue_counters().get("completed", 0),
+        }
+    )
+    if updated_rows > 0:
+        await _trigger_ai_pipeline_async("batch_update", updated_rows)
+
+    return {
+        "queued": len(pending_urls),
+        "processed": len(pending_urls),
+        "updated_rows": updated_rows,
+        "failed": failed,
+        "null": parse_null,
+    }
+
+
+async def run_scraper_engine() -> None:
+    """Single full run:
+    - sync sitemap URLs to SQLite queue
+    - process all pending URLs (resume-safe)
+    - export prioritized CSV
+    - auto-trigger pricing pipeline for updated/new rows
+    """
+    _init_state_db()
+    started_t = time.perf_counter()
+    started_at = _utc_now()
+
+    _merge_scraper_progress(
+        {
+            "running": True,
+            "started_at": started_at,
             "finished_at": None,
-            "urls_total": 0,
-            "urls_processed": 0,
+            "last_error": None,
+            "urls_total": _get_queue_counters().get("pending", 0),
+            "urls_processed": _get_queue_counters().get("completed", 0),
             "rows_in_csv": 0,
             "current_sitemap": None,
-            "last_error": None,
+            "mode": "single_run",
         }
     )
 
+    scraper = AsyncCompetitorScraper(concurrency_limit=15)
+    diagnostics: List[Dict[str, Any]] = []
+    counters = {
+        "fetch_exceptions": 0,
+        "parse_null": 0,
+        "updated_rows": 0,
+        "processed_batches": 0,
+    }
+
     try:
         async with aiohttp.ClientSession() as session:
-            for sitemap in competitor_sitemaps:
-                urls, diag = await scraper.scan_sitemap(session, sitemap)
-                raw_len = len(urls)
-                urls = _filter_salla_like_product_urls(urls)
-                sitemap_diagnostics.append(
-                    {
-                        "sitemap": sitemap,
-                        "urls_found": raw_len,
-                        "urls_product_pages": len(urls),
-                        "http_status": diag.get("http_status"),
-                        "fetch_error": diag.get("fetch_error"),
-                        "parse_error": diag.get("parse_error"),
-                    }
-                )
-                if not urls:
-                    logger.warning(
-                        "No product-like URLs after filter (raw from sitemap: %s).",
-                        raw_len,
-                    )
-                    continue
-
-                max_urls_env = os.environ.get("SCRAPER_MAX_URLS", "").strip()
-                if max_urls_env:
-                    try:
-                        lim = int(max_urls_env)
-                        if lim > 0 and len(urls) > lim:
-                            logger.info(
-                                "SCRAPER_MAX_URLS=%s — limiting to %s URLs", lim, lim
-                            )
-                            urls = urls[:lim]
-                    except ValueError:
-                        pass
-
-                urls_queued += len(urls)
-                _merge_scraper_progress(
-                    {
-                        "current_sitemap": sitemap,
-                        "urls_total": urls_queued,
-                    }
-                )
-                logger.info(
-                    "Starting async fetch for %s products from %s...", len(urls), sitemap
-                )
-                tasks = [scraper.fetch_and_parse_url(session, url) for url in urls]
-
-                chunk_size = 400
-                for i in range(0, len(tasks), chunk_size):
-                    chunk_tasks = tasks[i : i + chunk_size]
-                    results = await asyncio.gather(*chunk_tasks, return_exceptions=True)
-
-                    for r in results:
-                        if isinstance(r, Exception):
-                            fetch_exceptions += 1
-                        elif r is None:
-                            parse_null += 1
-
-                    valid_results = [
-                        r for r in results if r is not None and not isinstance(r, Exception)
-                    ]
-                    all_results.extend(valid_results)
-                    urls_processed_total += len(chunk_tasks)
-
-                    rows_saved = _save_competitor_csv_rows(all_results)
-                    _merge_scraper_progress(
-                        {
-                            "running": True,
-                            "urls_total": urls_queued,
-                            "urls_processed": urls_processed_total,
-                            "rows_in_csv": rows_saved,
-                            "current_sitemap": sitemap,
-                        }
-                    )
-
-                logger.info("Finished processing %s.", sitemap)
-
-        duration = round(time.perf_counter() - t0, 2)
-        finished_at = datetime.now(timezone.utc).isoformat()
-        rows_before = len(all_results)
-        rows_written = (
-            len(pd.DataFrame(all_results).drop_duplicates(subset=["comp_url"]))
-            if all_results
-            else 0
-        )
-
-        if all_results:
-            logger.info(
-                "JOB DONE. Saved %s records to data/competitors_latest.csv securely.",
-                rows_written,
-            )
-            success_rate = (
-                round((rows_written / urls_queued) * 100, 2) if urls_queued else 0.0
-            )
-            _write_scraper_last_run_meta(
+            diagnostics = await _sync_sitemaps_once(session, scraper)
+            q = _get_queue_counters()
+            _merge_scraper_progress(
                 {
-                    "status": "ok",
-                    "finished_at": finished_at,
-                    "duration_seconds": duration,
-                    "sitemaps_count": len(competitor_sitemaps),
-                    "urls_queued": urls_queued,
-                    "rows_extracted_before_dedupe": rows_before,
-                    "rows_written_csv": rows_written,
-                    "fetch_exceptions": fetch_exceptions,
-                    "parse_null": parse_null,
-                    "success_rate_pct": success_rate,
-                    "sitemap_diagnostics": sitemap_diagnostics,
+                    "urls_total": q.get("pending", 0) + q.get("completed", 0) + q.get("failed", 0),
+                    "urls_processed": q.get("completed", 0),
                 }
             )
-        else:
-            _write_scraper_last_run_meta(
-                {
-                    "status": "empty",
-                    "finished_at": finished_at,
-                    "duration_seconds": duration,
-                    "sitemaps_count": len(competitor_sitemaps),
-                    "urls_queued": urls_queued,
-                    "rows_extracted_before_dedupe": 0,
-                    "rows_written_csv": 0,
-                    "fetch_exceptions": fetch_exceptions,
-                    "parse_null": parse_null,
-                    "success_rate_pct": 0.0,
-                    "sitemap_diagnostics": sitemap_diagnostics,
-                }
-            )
+
+            batch_size = int(os.environ.get("SCRAPER_PENDING_BATCH_SIZE", "200"))
+            batch_size = max(20, min(batch_size, 1000))
+
+            while True:
+                out = await _process_pending_batch(session, scraper, batch_size=batch_size)
+                if out["processed"] == 0:
+                    break
+                counters["processed_batches"] += 1
+                counters["fetch_exceptions"] += out["failed"]
+                counters["parse_null"] += out["null"]
+                counters["updated_rows"] += out["updated_rows"]
+
     except Exception as e:
-        logger.exception("Scraper engine failed: %s", e)
-        _merge_scraper_progress(
-            {
-                "last_error": str(e),
-            }
-        )
+        logger.exception("run_scraper_engine failed: %s", e)
+        _merge_scraper_progress({"last_error": str(e)})
         raise
     finally:
-        _rows_final = (
-            len(pd.DataFrame(all_results).drop_duplicates(subset=["comp_url"]))
-            if all_results
-            else 0
+        q = _get_queue_counters()
+        rows_in_csv = _export_competitors_csv_prioritized()
+        finished_at = _utc_now()
+        duration = round(time.perf_counter() - started_t, 2)
+        status = "ok" if rows_in_csv > 0 else "empty"
+        _write_scraper_last_run_meta(
+            {
+                "status": status,
+                "finished_at": finished_at,
+                "duration_seconds": duration,
+                "sitemaps_count": len(_load_competitor_sitemaps()),
+                "urls_queued": q.get("pending", 0) + q.get("completed", 0) + q.get("failed", 0),
+                "rows_extracted_before_dedupe": rows_in_csv,
+                "rows_written_csv": rows_in_csv,
+                "fetch_exceptions": counters["fetch_exceptions"],
+                "parse_null": counters["parse_null"],
+                "success_rate_pct": (
+                    round((q.get("completed", 0) / max(1, q.get("completed", 0) + q.get("failed", 0))) * 100, 2)
+                ),
+                "sitemap_diagnostics": diagnostics,
+            }
         )
         _merge_scraper_progress(
             {
                 "running": False,
-                "finished_at": datetime.now(timezone.utc).isoformat(),
-                "urls_total": urls_queued,
-                "urls_processed": urls_processed_total,
-                "rows_in_csv": _rows_final,
+                "finished_at": finished_at,
+                "urls_total": q.get("pending", 0) + q.get("completed", 0) + q.get("failed", 0),
+                "urls_processed": q.get("completed", 0),
+                "rows_in_csv": rows_in_csv,
             }
         )
+
+
+async def run_continuous_scraper_service() -> None:
+    """Continuous, fault-tolerant scraper:
+    - sitemap sync every 2 hours
+    - keeps processing pending queue forever
+    """
+    _init_state_db()
+    scraper = AsyncCompetitorScraper(concurrency_limit=15)
+    sync_every_seconds = 2 * 60 * 60
+    poll_seconds = int(os.environ.get("SCRAPER_IDLE_POLL_SECONDS", "20"))
+    batch_size = int(os.environ.get("SCRAPER_PENDING_BATCH_SIZE", "200"))
+    batch_size = max(20, min(batch_size, 1000))
+    next_sync_at = 0.0
+
+    logger.info("Continuous scraper service started.")
+    _merge_scraper_progress({"running": True, "mode": "continuous"})
+
+    async with aiohttp.ClientSession() as session:
+        while True:
+            now = time.time()
+            if now >= next_sync_at:
+                try:
+                    diagnostics = await _sync_sitemaps_once(session, scraper)
+                    _write_scraper_last_run_meta(
+                        {
+                            "status": "sync_only",
+                            "finished_at": _utc_now(),
+                            "duration_seconds": 0,
+                            "sitemaps_count": len(_load_competitor_sitemaps()),
+                            "urls_queued": _get_queue_counters().get("pending", 0),
+                            "rows_extracted_before_dedupe": 0,
+                            "rows_written_csv": _export_competitors_csv_prioritized(),
+                            "fetch_exceptions": 0,
+                            "parse_null": 0,
+                            "success_rate_pct": 0.0,
+                            "sitemap_diagnostics": diagnostics,
+                        }
+                    )
+                except Exception as e:
+                    logger.error("Periodic sitemap sync failed: %s", e)
+                    _merge_scraper_progress({"last_error": str(e)})
+                next_sync_at = now + sync_every_seconds
+
+            try:
+                out = await _process_pending_batch(session, scraper, batch_size=batch_size)
+                if out["processed"] == 0:
+                    await asyncio.sleep(max(5, poll_seconds))
+                else:
+                    q = _get_queue_counters()
+                    _merge_scraper_progress(
+                        {
+                            "running": True,
+                            "urls_total": q.get("pending", 0) + q.get("completed", 0) + q.get("failed", 0),
+                            "urls_processed": q.get("completed", 0),
+                        }
+                    )
+            except Exception as e:
+                logger.exception("Batch processing failed, will continue: %s", e)
+                _merge_scraper_progress({"last_error": str(e)})
+                await asyncio.sleep(10)
 
 
 def main() -> None:
@@ -693,7 +1022,11 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    asyncio.run(run_scraper_engine())
+    # SCRAPER_CONTINUOUS=1 => service mode (sync each 2h + process pending forever)
+    if os.environ.get("SCRAPER_CONTINUOUS", "0").strip() == "1":
+        asyncio.run(run_continuous_scraper_service())
+    else:
+        asyncio.run(run_scraper_engine())
 
 
 if __name__ == "__main__":

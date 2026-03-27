@@ -5,7 +5,7 @@ utils/db_manager.py - v18.0
 - قرارات لكل منتج (موافق/تأجيل/إزالة)
 - سجل كامل بالتاريخ والوقت
 """
-import sqlite3, json, os, tempfile
+import sqlite3, json, os, tempfile, logging
 from datetime import datetime
 
 _DB_NAME = "pricing_v18.db"
@@ -27,6 +27,7 @@ def _resolve_db_path() -> str:
 
 
 DB_PATH = _resolve_db_path()
+logger = logging.getLogger(__name__)
 
 
 def _ts():
@@ -714,7 +715,7 @@ def migrate_db_v26():
         conn.commit()
         conn.close()
     except Exception as e:
-        print(f"Migration v26 error: {e}")
+        logger.exception("Migration v26 error: %s", e)
         try: conn.close()
         except: pass
 

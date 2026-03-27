@@ -5,11 +5,15 @@ import threading
 import pandas as pd
 import streamlit as st
 
+from config import MAIN_STORE_DOMAIN, MAIN_STORE_NAME, is_main_store_domain
 from utils.sitemap_resolve import resolve_store_to_sitemap_url
 
 _SCRAPER_PROGRESS = os.path.join("data", "scraper_progress.json")
 
-COMPETITORS_FILE = 'data/competitors_list.json'
+COMPETITORS_FILE = "data/competitors_list.json"
+# مرجع متجرنا (للعرض — لا يُكشط كمنافس من هذه القائمة)
+PRIMARY_STORE_SITEMAP = "https://mahwous.com/sitemap.xml"
+PRIMARY_STORE_LABEL = "مهووس — متجرنا"
 
 
 def load_competitors():
@@ -35,12 +39,31 @@ def save_competitors(competitors_list):
 
 def render_competitor_management_ui():
     st.markdown("## 🏢 إدارة روابط المنافسين (Sitemaps)")
-    st.info(
-        "أدخل **رابط المتجر** (مثل `https://mahwous.com/`) أو **رابط Sitemap مباشر**. "
-        "التطبيق يستنتج تلقائياً ملف الـ sitemap الصحيح من `robots.txt` أو المسارات الشائعة."
-    )
+    with st.expander("ℹ️ تعليمات الإضافة", expanded=False):
+        st.info(
+            "أدخل **رابط المتجر** (مثل `https://mahwous.com/`) أو **رابط Sitemap مباشر**. "
+            "التطبيق يستنتج تلقائياً ملف الـ sitemap الصحيح من `robots.txt` أو المسارات الشائعة."
+        )
 
     competitors = load_competitors()
+    # تطبيع العناصر (قد تكون نصوص sitemap أو dict من قائمة المنافسين الموسعة)
+    normalized_rows = []
+    normalized_urls = []
+    for i, item in enumerate(competitors):
+        if isinstance(item, dict):
+            name = str(item.get("name", f"Competitor {i+1}") or f"Competitor {i+1}")
+            domain = str(item.get("domain", "") or "").strip()
+            url = domain
+            if domain and not domain.endswith("/"):
+                domain += "/"
+            if domain and "sitemap" not in domain.lower():
+                url = f"{domain}sitemap.xml"
+            normalized_rows.append({"name": name, "domain": str(item.get("domain", "") or ""), "sitemap": url})
+            normalized_urls.append(url)
+        else:
+            url = str(item or "").strip()
+            normalized_rows.append({"name": f"Competitor {i+1}", "domain": "", "sitemap": url})
+            normalized_urls.append(url)
 
     with st.form("add_competitor_form", clear_on_submit=True):
         col1, col2 = st.columns([3, 1])
@@ -58,38 +81,61 @@ def render_competitor_management_ui():
             if not (new_url and new_url.strip()):
                 st.error("الرجاء إدخال رابط.")
             else:
+                if is_main_store_domain(new_url.strip()):
+                    st.error(
+                        f"❌ لا يمكن إضافة `{MAIN_STORE_NAME}` ({MAIN_STORE_DOMAIN}) كمنافس. "
+                        "هو baseline الأساسي للمقارنة."
+                    )
+                    st.stop()
                 resolved, msg = resolve_store_to_sitemap_url(new_url.strip())
                 if not resolved:
                     st.error(msg)
-                elif resolved in competitors:
+                elif resolved in normalized_urls:
                     st.warning("هذا الرابط (مُسنّداً) مضاف مسبقاً.")
                 else:
-                    competitors.append(resolved)
+                    competitors.append(resolved)  # keep legacy-compatible format for scraper
                     save_competitors(competitors)
                     st.success(f"تمت الإضافة بنجاح! {msg}")
                     st.rerun()
 
-    st.markdown(f"### 📋 قائمة المنافسين الحاليين ({len(competitors)})")
-    if not competitors:
-        st.warning("لم تقم بإضافة أي منافسين بعد. ابدأ بإضافة 7 منافسين كاختبار.")
-    else:
-        for idx, url in enumerate(competitors):
-            c1, c2 = st.columns([4, 1])
-            with c1:
-                st.code(url)
-            with c2:
-                if st.button("🗑️ حذف", key=f"del_{idx}", use_container_width=True):
-                    competitors.pop(idx)
+    with st.expander(f"📋 قائمة المنافسين الحالية (منسدلة) — {len(competitors)}", expanded=False):
+        if not competitors:
+            st.warning("لم تقم بإضافة أي منافسين بعد. ابدأ بإضافة 7 منافسين كاختبار.")
+        else:
+            df_view = pd.DataFrame(normalized_rows)
+            # ترتيب أعمدة العرض ليكون ثابتاً وواضحاً
+            keep_cols = [c for c in ["name", "domain", "sitemap"] if c in df_view.columns]
+            df_view = df_view[keep_cols] if keep_cols else df_view
+            st.dataframe(df_view, use_container_width=True, hide_index=True)
+            st.markdown("#### 🗑️ حذف منافس")
+            options = [f"{r['name']} — {r['sitemap']}" for r in normalized_rows]
+            pick = st.selectbox(
+                "اختر المنافس للحذف:",
+                options=options,
+                index=0,
+                key="competitor_delete_pick",
+            )
+            del_idx = options.index(pick) if options else -1
+            if st.button("🗑️ حذف المحدد", key="competitor_delete_btn", use_container_width=True):
+                if del_idx >= 0:
+                    competitors.pop(del_idx)
                     save_competitors(competitors)
+                    st.success("تم الحذف بنجاح.")
                     st.rerun()
+
+    # لا نعرض القائمة خارج الـ expander لتفادي أي مخرجات خام/متكررة.
 
 
 def render_competitor_scrape_page():  # noqa: C901
     """صفحة كاملة: إدارة روابط المنافسين + كشط مع حفظ وعرض تدريجي."""
     st.header("🏢 كشط المنافسين")
     st.caption(
-        "**متجر مهووس** يمكن أن يكون مرجعك الأساسي للاختبار؛ أضف لاحقاً متاجر المنافسين بعد "
-        "تنظيم الروابط. يُحفظ الملف `data/competitors_latest.csv` أثناء الكشط ويُحدَّث الجدول تلقائياً."
+        f"**{PRIMARY_STORE_LABEL}** = مرجع ملف منتجاتك (رفع من «📂 رفع الملفات») — "
+        f"Sitemap المرجعي: `{PRIMARY_STORE_SITEMAP}`. أدناه **روابط كشط المنافسين فقط**."
+    )
+    st.success(
+        "المنافسون المقترحون: **عالم جيفنشي** · **خبير العطور** · **سارا ميك أب** — "
+        "يُكشطون إلى `competitors_latest.csv` لاستخدامها في المقارنة و**بطاقات VS** في الأقسام."
     )
 
     render_competitor_management_ui()
@@ -198,7 +244,29 @@ def render_competitor_scrape_page():  # noqa: C901
                 st.success(
                     f"✅ **{len(df_comp)}** صف محفوظ — يُحدَّث أثناء الكشط إن كان يعملاً."
                 )
-                st.dataframe(df_comp, use_container_width=True, height=400)
+                # توحيد الأعمدة لعرض جدولي واضح بالصيغة العربية المطلوبة
+                d = df_comp.copy()
+                col_map = {
+                    "name": "الاسم",
+                    "price": "السعر",
+                    "brand": "الماركة",
+                    "image_url": "رابط_الصورة",
+                    "comp_image_url": "رابط_الصورة",
+                    "comp_url": "رابط_المنتج",
+                    "url": "رابط_المنتج",
+                }
+                for en, ar in col_map.items():
+                    if en in d.columns and ar not in d.columns:
+                        d[ar] = d[en]
+                if "sku" not in d.columns:
+                    d["sku"] = ""
+
+                table_cols = ["الاسم", "السعر", "الماركة", "رابط_الصورة", "رابط_المنتج", "sku"]
+                for c in table_cols:
+                    if c not in d.columns:
+                        d[c] = ""
+                d = d[table_cols]
+                st.dataframe(d, use_container_width=True, height=400, hide_index=True)
                 st.download_button(
                     "📥 تنزيل CSV",
                     data=df_comp.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig"),

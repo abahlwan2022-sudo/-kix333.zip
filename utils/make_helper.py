@@ -18,7 +18,11 @@ import requests
 import json
 import os
 import time
+import logging
 from typing import List, Dict, Any, Optional
+import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 
 # ── Webhook URLs (Environment أو Streamlit Secrets فقط — لا تضع روابط إنتاج في الكود) ──
@@ -38,7 +42,7 @@ def _webhook_from_env_or_secrets(key: str) -> str:
 
 def get_webhook_update_prices() -> str:
     """قراءة حيّة من البيئة أو secrets (لا تعتمد على وقت استيراد الوحدة)."""
-    return _webhook_from_env_or_secrets("WEBHOOK_UPDATE_PRICES")
+    return _webhook_from_env_or_secrets("WEBHOOK_UPDATE_PRICES") or _webhook_from_env_or_secrets("MAKE_WEBHOOK_URL")
 
 
 def get_webhook_new_products() -> str:
@@ -57,29 +61,103 @@ def _post_to_webhook(url: str, payload: Any) -> Dict:
         return {"success": False, "message": "❌ Webhook URL غير محدد", "status_code": 0}
     try:
         headers = {"Content-Type": "application/json"}
+        logger.info("POST webhook payload keys=%s", list(payload.keys()) if isinstance(payload, dict) else type(payload))
         resp = requests.post(
             url,
             json=payload,
             headers=headers,
             timeout=TIMEOUT
         )
-        if resp.status_code in (200, 201, 202, 204):
-            return {
-                "success": True,
-                "message": f"✅ تم الإرسال بنجاح ({resp.status_code})",
-                "status_code": resp.status_code,
-            }
+        resp.raise_for_status()
         return {
-            "success": False,
-            "message": f"❌ HTTP {resp.status_code}: {resp.text[:200]}",
+            "success": True,
+            "message": f"✅ تم الإرسال بنجاح ({resp.status_code})",
             "status_code": resp.status_code,
         }
+    except requests.exceptions.HTTPError as e:
+        code = getattr(e.response, "status_code", 0)
+        body = getattr(e.response, "text", "")[:200] if getattr(e, "response", None) else ""
+        logger.exception("Make webhook HTTP error: status=%s body=%s", code, body)
+        return {"success": False, "message": f"❌ HTTP {code}: {body}", "status_code": code}
     except requests.exceptions.Timeout:
+        logger.exception("Make webhook timeout")
         return {"success": False, "message": "❌ انتهت مهلة الاتصال (Timeout)", "status_code": 0}
     except requests.exceptions.ConnectionError:
+        logger.exception("Make webhook connection error")
         return {"success": False, "message": "❌ فشل الاتصال بـ Make — تحقق من الإنترنت", "status_code": 0}
     except Exception as e:
+        logger.exception("Make webhook unexpected error")
         return {"success": False, "message": f"❌ خطأ غير متوقع: {str(e)}", "status_code": 0}
+
+
+def send_approved_prices_to_make(df: pd.DataFrame) -> bool:
+    """
+    إرسال أسعار المنتجات المعتمدة إلى Make.com بصيغة إنتاجية.
+    Payload:
+      {"products": [{"sku":"...", "new_price": 123.0, "action":"Increase Price 📈"}, ...]}
+    """
+    if df is None or df.empty:
+        logger.info("send_approved_prices_to_make: empty dataframe")
+        return False
+
+    webhook = get_webhook_update_prices()
+    if not webhook:
+        logger.error("send_approved_prices_to_make: webhook URL missing")
+        return False
+
+    payload_rows: List[Dict[str, Any]] = []
+    work = df.copy()
+    if "sku" not in work.columns:
+        logger.error("send_approved_prices_to_make: sku column missing")
+        return False
+
+    for _, row in work.iterrows():
+        sku = _clean_pid(row.get("sku", "")) or str(row.get("sku", "")).strip()
+        if not sku:
+            continue
+        new_price = _safe_float(
+            row.get("suggested_price", 0) or row.get("new_price", 0) or row.get("price", 0)
+        )
+        if new_price <= 0:
+            continue
+        action = str(row.get("action_required", "") or row.get("action", "approved")).strip() or "approved"
+        payload_rows.append(
+            {
+                "sku": sku,
+                "new_price": float(new_price),
+                "action": action,
+            }
+        )
+
+    if not payload_rows:
+        logger.warning("send_approved_prices_to_make: no valid rows to send")
+        return False
+
+    payload = {"products": payload_rows}
+    try:
+        logger.info("Sending approved prices to Make rows=%s", len(payload_rows))
+        resp = requests.post(
+            webhook,
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        logger.info("Make approved prices success status=%s", resp.status_code)
+        return True
+    except requests.exceptions.Timeout:
+        logger.exception("send_approved_prices_to_make timeout")
+        return False
+    except requests.exceptions.HTTPError:
+        logger.exception(
+            "send_approved_prices_to_make http_error status=%s body=%s",
+            getattr(resp, "status_code", 0),
+            getattr(resp, "text", "")[:300],
+        )
+        return False
+    except Exception:
+        logger.exception("send_approved_prices_to_make unexpected error")
+        return False
 
 
 # ── تحويل float آمن ───────────────────────────────────────────────────────
