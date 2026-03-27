@@ -22,8 +22,9 @@ import sqlite3
 import time
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
+from datetime import timedelta
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote
 
 import aiohttp
 import pandas as pd
@@ -39,7 +40,13 @@ SCRAPER_PROGRESS_JSON = os.path.join(DATA_DIR, "scraper_progress.json")
 STATE_DB_PATH = os.path.join(DATA_DIR, "scraper_state.db")
 COMPETITOR_CSV = os.path.join(DATA_DIR, "competitors_latest.csv")
 COMPETITOR_TMP_CSV = os.path.join(DATA_DIR, "competitors_temp.csv")
+SCRAPER_STOP_FLAG_PATH = os.path.join(DATA_DIR, "scraper_stop.flag")
 COMPETITORS_FILE = os.path.join(DATA_DIR, "competitors_list.json")
+
+# لمنع تراكم الفشل/التكرار غير المفيد
+MAX_URL_ATTEMPTS = int(os.environ.get("SCRAPER_MAX_URL_ATTEMPTS", "3"))
+FAILED_RETENTION_HOURS = int(os.environ.get("SCRAPER_FAILED_RETENTION_HOURS", "72"))
+COMPLETED_RETENTION_HOURS = int(os.environ.get("SCRAPER_COMPLETED_RETENTION_HOURS", "168"))
 
 
 def _utc_now() -> str:
@@ -133,11 +140,13 @@ def _load_competitor_sitemaps() -> List[Dict[str, str]]:
             for item in data:
                 if isinstance(item, dict):
                     domain = str(item.get("domain", "")).strip()
+                    # بعض الإدخالات الفاسدة قد تخزن dict كنص/URL-encoded داخل domain.
+                    domain = _normalize_competitor_domain(domain)
                     name = str(item.get("name", "")).strip() or domain
                     if domain and not is_main_store_domain(domain):
                         out.append({"name": name, "domain": domain})
                 elif isinstance(item, str):
-                    u = item.strip()
+                    u = _normalize_competitor_domain(item.strip())
                     # دعم حالات legacy التي خزّنت dict كنص
                     if u.startswith("{") and "domain" in u:
                         parsed = None
@@ -159,6 +168,31 @@ def _load_competitor_sitemaps() -> List[Dict[str, str]]:
             return out
     except Exception:
         return []
+
+
+def _normalize_competitor_domain(raw: str) -> str:
+    """تنظيف إدخال المنافس: يدعم URL-encoded dict/string legacy."""
+    s = str(raw or "").strip()
+    if not s:
+        return ""
+    try:
+        dec = unquote(s).strip()
+        if dec:
+            s = dec
+    except Exception:
+        pass
+    if s.startswith("{") and "domain" in s:
+        parsed = None
+        try:
+            parsed = json.loads(s)
+        except Exception:
+            try:
+                parsed = ast.literal_eval(s)
+            except Exception:
+                parsed = None
+        if isinstance(parsed, dict):
+            s = str(parsed.get("domain", "")).strip()
+    return s
 
 
 def _insert_discovered_urls(sitemap_url: str, urls: List[str]) -> int:
@@ -194,10 +228,11 @@ def _load_pending_urls(limit: int) -> List[str]:
         SELECT url
         FROM url_queue
         WHERE status='pending'
+          AND attempt_count < ?
         ORDER BY updated_at ASC, created_at ASC
         LIMIT ?
         """,
-        (int(limit),),
+        (int(MAX_URL_ATTEMPTS), int(limit)),
     ).fetchall()
     conn.close()
     return [str(r["url"]) for r in rows]
@@ -338,8 +373,42 @@ def _export_competitors_csv_prioritized() -> int:
         }
     )
     out = out[["الاسم", "السعر", "الماركة", "رابط_الصورة", "رابط_المنتج", "sku"]]
-    out.to_csv(COMPETITOR_TMP_CSV, index=False, encoding="utf-8-sig")
-    shutil.move(COMPETITOR_TMP_CSV, COMPETITOR_CSV)
+    tmp_path = os.path.join(
+        DATA_DIR,
+        f"competitors_temp_{os.getpid()}_{int(time.time())}.csv",
+    )
+    try:
+        out.to_csv(tmp_path, index=False, encoding="utf-8-sig")
+        # على ويندوز قد يحدث lock مؤقت على الملف الهدف (Excel/قارئ خارجي).
+        # استخدام tmp فريد يقلل احتمال القفل على نفس الملف.
+        for _ in range(3):
+            try:
+                os.replace(tmp_path, COMPETITOR_CSV)
+                tmp_path = ""  # moved successfully
+                break
+            except PermissionError:
+                time.sleep(0.4)
+    except PermissionError as e:
+        logger.warning("CSV export skipped بسبب قفل ملف: %s", e)
+        try:
+            if tmp_path and os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+        # لا نكسر دورة الكشط؛ نُبقي الملف الحالي كما هو.
+        if os.path.exists(COMPETITOR_CSV):
+            try:
+                return int(len(pd.read_csv(COMPETITOR_CSV)))
+            except Exception:
+                return len(out)
+        return len(out)
+    finally:
+        # تنظيف tmp إن فشل النقل
+        try:
+            if tmp_path and os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
     return len(out)
 
 
@@ -353,6 +422,47 @@ def _get_queue_counters() -> Dict[str, int]:
     for r in rows:
         out[str(r["status"])] = int(r["cnt"])
     return out
+
+
+def _cleanup_state_queues() -> None:
+    """
+    تنظيف دوري لتقليل تراكم `url_queue`/التكرارات غير المفيدة.
+    الهدف: تشغيل مستمر بدون تضخم طابور الفشل.
+    """
+    try:
+        cutoff_failed = _utc_now_dt() - timedelta(hours=FAILED_RETENTION_HOURS)
+        cutoff_completed = _utc_now_dt() - timedelta(hours=COMPLETED_RETENTION_HOURS)
+        cutoff_failed_iso = cutoff_failed.isoformat()
+        cutoff_completed_iso = cutoff_completed.isoformat()
+
+        conn = _get_state_conn()
+        cur = conn.cursor()
+        # حذف الفشل القديم أو الذي تعدّى الحد
+        cur.execute(
+            """
+            DELETE FROM url_queue
+            WHERE (status='failed' AND attempt_count >= ?)
+               OR (status='failed' AND last_seen_at < ?)
+            """,
+            (MAX_URL_ATTEMPTS, cutoff_failed_iso),
+        )
+        # حذف المكتمل القديم (لا نريد تخزينه للأبد)
+        cur.execute(
+            """
+            DELETE FROM url_queue
+            WHERE status='completed' AND last_seen_at < ?
+            """,
+            (cutoff_completed_iso,),
+        )
+        conn.commit()
+        conn.close()
+    except Exception:
+        # لا نريد كسر الخدمة بسبب تنظيف غير حاسم
+        logger.exception("cleanup_state_queues failed")
+
+
+def _utc_now_dt() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 async def _trigger_ai_pipeline_async(reason: str, changed_rows: int) -> None:
@@ -866,6 +976,7 @@ async def _process_pending_batch(
             "urls_processed": _get_queue_counters().get("completed", 0),
         }
     )
+    _cleanup_state_queues()
     if updated_rows > 0:
         await _trigger_ai_pipeline_async("batch_update", updated_rows)
 
@@ -991,10 +1102,24 @@ async def run_continuous_scraper_service() -> None:
 
     async with aiohttp.ClientSession() as session:
         while True:
+            if os.path.exists(SCRAPER_STOP_FLAG_PATH):
+                _merge_scraper_progress(
+                    {
+                        "running": False,
+                        "mode": "stopped_by_flag",
+                        "last_error": "stopped_by_user_flag",
+                    }
+                )
+                break
             now = time.time()
             if now >= next_sync_at:
                 try:
+                    _merge_scraper_progress({"phase": "sync", "last_sync_started_at": _utc_now()})
                     diagnostics = await _sync_sitemaps_once(session, scraper)
+                    q = _get_queue_counters()
+                    completed = q.get("completed", 0)
+                    failed = q.get("failed", 0)
+                    sr = (completed / max(1, completed + failed)) * 100.0
                     _write_scraper_last_run_meta(
                         {
                             "status": "sync_only",
@@ -1006,10 +1131,11 @@ async def run_continuous_scraper_service() -> None:
                             "rows_written_csv": _export_competitors_csv_prioritized(),
                             "fetch_exceptions": 0,
                             "parse_null": 0,
-                            "success_rate_pct": 0.0,
+                            "success_rate_pct": round(sr, 2),
                             "sitemap_diagnostics": diagnostics,
                         }
                     )
+                    _merge_scraper_progress({"phase": "process"})
                 except Exception as e:
                     logger.error("Periodic sitemap sync failed: %s", e)
                     _merge_scraper_progress({"last_error": str(e)})
@@ -1020,6 +1146,7 @@ async def run_continuous_scraper_service() -> None:
                 if out["processed"] == 0:
                     await asyncio.sleep(max(5, poll_seconds))
                 else:
+                    _merge_scraper_progress({"phase": "process"})
                     q = _get_queue_counters()
                     _merge_scraper_progress(
                         {

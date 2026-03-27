@@ -4,6 +4,8 @@ import threading
 import subprocess
 import sys
 import time
+import sqlite3
+from datetime import datetime, timezone
 
 import pandas as pd
 import streamlit as st
@@ -12,6 +14,7 @@ from config import MAIN_STORE_DOMAIN, MAIN_STORE_NAME, is_main_store_domain
 from utils.sitemap_resolve import resolve_store_to_sitemap_url
 
 _SCRAPER_PROGRESS = os.path.join("data", "scraper_progress.json")
+STOP_FLAG_PATH = os.path.join("data", "scraper_stop.flag")
 
 COMPETITORS_FILE = "data/competitors_list.json"
 # مرجع متجرنا (للعرض — لا يُكشط كمنافس من هذه القائمة)
@@ -179,6 +182,89 @@ def render_competitor_scrape_page():  # noqa: C901
         with c3:
             st.caption(f"Sitemap: `{prog.get('current_sitemap', '—')}`")
 
+    # ── مراقبة + إيقاف تلقائي عند التعطل ─────────────────────────────────
+    with st.expander("🛑 مراقبة الكشط (Live) + إيقاف إذا خرب", expanded=False):
+        stop_flag = os.path.exists(STOP_FLAG_PATH)
+        phase = str(prog.get("phase", "process") or "process").lower()
+
+        auto_stop_if_stalled = st.checkbox(
+            "إيقاف تلقائي إذا توقف التقدم (بدون تراكم/تعليق)",
+            value=False,
+        )
+        stall_minutes = st.number_input(
+            "بعد كم دقيقة بدون تقدم يعتبر توقف",
+            min_value=1,
+            max_value=120,
+            value=60,
+            step=1,
+        )
+
+        if st.button("🛑 إيقاف الآن", use_container_width=True, disabled=stop_flag):
+            os.makedirs("data", exist_ok=True)
+            with open(STOP_FLAG_PATH, "w", encoding="utf-8") as f:
+                f.write(str(datetime.now(timezone.utc).isoformat()))
+            st.success("✅ تم طلب إيقاف الخدمة. انتظر 10-30 ثانية.")
+            st.rerun()
+
+        if stop_flag:
+            st.error("🛑 تم ضبط `scraper_stop.flag` — الخدمة ستتوقف بعد اكتمال الدورة الحالية.")
+        else:
+            st.success("✅ الخدمة تعمل (إذا كان الكشط متاحًا في الخلفية).")
+
+        current_processed = int(prog.get("urls_processed", 0) or 0)
+        now_ts = time.time()
+
+        last_processed = st.session_state.get("scraper_last_urls_processed", None)
+        last_change_time = st.session_state.get("scraper_last_processed_change_at", None)
+        stalled = False
+
+        if last_processed is None:
+            st.session_state["scraper_last_urls_processed"] = current_processed
+            st.session_state["scraper_last_processed_change_at"] = now_ts
+        else:
+            if current_processed != last_processed:
+                st.session_state["scraper_last_urls_processed"] = current_processed
+                st.session_state["scraper_last_processed_change_at"] = now_ts
+            else:
+                if last_change_time is not None and (now_ts - last_change_time) > stall_minutes * 60:
+                    stalled = True
+
+        # أثناء مرحلة جلب الـ sitemap (`phase=sync`) قد لا يتحرك `urls_processed`.
+        # لذلك نتجنب اعتبارها "تعطل" حتى لا نوقف الخدمة خطأ.
+        if phase != "process":
+            stalled = False
+
+        if stalled and auto_stop_if_stalled and not stop_flag:
+            os.makedirs("data", exist_ok=True)
+            with open(STOP_FLAG_PATH, "w", encoding="utf-8") as f:
+                f.write(str(datetime.now(timezone.utc).isoformat()))
+            st.error("🛑 تم الإيقاف تلقائياً: لا يوجد تقدم خلال الفترة المحددة.")
+            st.rerun()
+
+        colh1, colh2, colh3 = st.columns(3)
+        with colh1:
+            st.metric("urls_processed", f"{current_processed:,}")
+        with colh2:
+            st.metric("stalled", "نعم" if stalled else "لا")
+        with colh3:
+            st.metric("stall_limit", f"{stall_minutes} دقيقة")
+
+        # عرض عدّادات الطابور كـ جدول سريع
+        q_df = pd.DataFrame()
+        try:
+            db_path = os.path.join(os.getcwd(), "data", "scraper_state.db")
+            if os.path.exists(db_path):
+                conn = sqlite3.connect(db_path)
+                q_rows = conn.execute(
+                    "SELECT status, COUNT(*) AS cnt FROM url_queue GROUP BY status"
+                ).fetchall()
+                conn.close()
+                q_df = pd.DataFrame(q_rows, columns=["status", "count"])
+        except Exception:
+            q_df = pd.DataFrame()
+        if not q_df.empty:
+            st.dataframe(q_df, use_container_width=True, hide_index=True)
+
     # تحقق من وجود كتالوج مهووس قبل السماح بالكشط
     our_df = getattr(st.session_state, "our_df", None)
     has_store = isinstance(our_df, pd.DataFrame) and not our_df.empty
@@ -187,7 +273,7 @@ def render_competitor_scrape_page():  # noqa: C901
 
     col_btn, col_live = st.columns([1, 2])
     with col_btn:
-        start_disabled = prog_running or not has_store
+        start_disabled = prog_running or not has_store or os.path.exists(STOP_FLAG_PATH)
         if st.button(
             "🚀 بدء جلب بيانات المنافسين الآن",
             use_container_width=True,
@@ -195,7 +281,7 @@ def render_competitor_scrape_page():  # noqa: C901
             key="btn_start_scrape_page",
         ):
             # تشغيل الكاشط في عملية خلفية غير حاجبة
-            cmd = [sys.executable, "-m", "utils.async_scraper"]
+            cmd = [sys.executable, os.path.join(os.getcwd(), "run_background_worker.py")]
             try:
                 proc = subprocess.Popen(
                     cmd,
@@ -242,14 +328,19 @@ def render_competitor_scrape_page():  # noqa: C901
 
         # مجموعات كتالوج مهووس (SKU + name)
         our = our_df.copy() if has_store else pd.DataFrame()
+        _our_sku_col = next(
+            (c for c in ("sku", "رقم المنتج", "رمز المنتج sku", "product_id") if c in our.columns),
+            None,
+        )
+        _our_name_col = next(
+            (c for c in ("name", "اسم المنتج", "أسم المنتج", "product_name") if c in our.columns),
+            None,
+        )
         our_skus = set(
-            our.get("sku", pd.Series(dtype=str)).astype(str).str.strip().tolist()
+            our.get(_our_sku_col, pd.Series(dtype=str)).astype(str).str.strip().tolist()
         )
         our_names = set(
-            our.get("name", our.get("product_name", pd.Series(dtype=str)))
-            .astype(str)
-            .str.strip()
-            .tolist()
+            our.get(_our_name_col, pd.Series(dtype=str)).astype(str).str.strip().tolist()
         )
 
         d["__sku"] = d["sku"].astype(str).str.strip()

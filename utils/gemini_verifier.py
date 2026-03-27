@@ -9,12 +9,36 @@ import streamlit as st
 class GeminiMatchVerifier:
     def __init__(self) -> None:
         api_key = ""
-        try:
-            api_key = str(st.secrets.get("GEMINI_API_KEY", "")).strip()
-        except Exception:
-            api_key = ""
+
+        def _from_secrets(*keys: str) -> str:
+            try:
+                for k in keys:
+                    v = str(st.secrets.get(k, "")).strip()
+                    if v:
+                        return v
+            except Exception:
+                return ""
+            return ""
+
+        def _from_env(*keys: str) -> str:
+            for k in keys:
+                v = str(os.environ.get(k, "")).strip()
+                if v:
+                    return v
+            return ""
+
+        api_key = _from_secrets("GEMINI_API_KEY", "GOOGLE_API_KEY")
         if not api_key:
-            api_key = str(os.environ.get("GEMINI_API_KEY", "")).strip()
+            # يدعم صيغة قائمة مفاتيح مفصولة بفواصل
+            multi = _from_secrets("GEMINI_API_KEYS")
+            if multi:
+                api_key = next((x.strip() for x in multi.split(",") if x.strip()), "")
+        if not api_key:
+            api_key = _from_env("GEMINI_API_KEY", "GOOGLE_API_KEY")
+        if not api_key:
+            multi_env = _from_env("GEMINI_API_KEYS")
+            if multi_env:
+                api_key = next((x.strip() for x in multi_env.split(",") if x.strip()), "")
 
         self.enabled = bool(api_key)
         if self.enabled:
