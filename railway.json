@@ -1,18 +1,11 @@
 {
- "$schema": "https://railway.app/railway.schema.json",
- "build": {
- "builder": "DOCKERFILE",
- "dockerfilePath": "Dockerfile"
- },
- "deploy": {
- "restartPolicyType": "ON_FAILURE",
- "restartPolicyMaxRetries": 3
- },
- "networking": {
- "serviceDomains": {
- "web": {
- "port": 8501
- }
- }
- }
+  "$schema": "https://railway.app/railway.schema.json",
+  "build": {
+    "builder": "DOCKERFILE",
+    "dockerfilePath": "Dockerfile"
+  },
+  "deploy": {
+    "restartPolicyType": "ON_FAILURE",
+    "restartPolicyMaxRetries": 3
+  }
 }

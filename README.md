@@ -58,14 +58,57 @@ WEBHOOK_NEW_PRODUCTS = "https://hook.eu2.make.com/..."
 2. في **Variables** أضف أسرار الإنتاج (Gemini، Webhooks، إلخ) — **لا** تضعها في الكود.
 3. المنفذ: التطبيق يستمع على **8501** (كما في `Dockerfile`).
 
+### تشغيل 24/7 (موصى به)
+
+لتحقيق التشغيل التلقائي الكامل: أنشئ **خدمتين** في Railway من نفس المستودع:
+
+1. **Web Service** (واجهة Streamlit)
+   - Start Command: الافتراضي (Dockerfile / Streamlit)
+2. **Worker Service** (الخلفية المستمرة)
+   - Start Command:
+     ```bash
+     python run_background_worker.py
+     ```
+   - Variables:
+     - `SCRAPER_CONTINUOUS=1`
+     - `SCRAPER_PENDING_BATCH_SIZE=200` (اختياري)
+     - `SCRAPER_IDLE_POLL_SECONDS=20` (اختياري)
+     - `AUTO_PIPELINE_MIN_INTERVAL_SEC=120` (اختياري)
+
+بهذا الشكل:
+- Worker يزامن الـ sitemap كل ساعتين ويكمل من pending بعد أي restart.
+- Web يعرض النتائج الجاهزة فقط (`data/final_priced_latest.csv`) بدون انتظار تشغيل يدوي.
+
 ---
 
 ## البيانات والكشط
 
 - **`data/competitors_list.json`**: قائمة روابط (مثل sitemap منتجات). في المستودع يُفضَّل الإبقاء على قائمة **فارغة** `[]` أو روابط **تجريبية** فقط؛ أضف روابط الإنتاج محلياً أو عبر نسخة خاصة من الملف.
 - **`data/competitors_latest.csv`**: مخرجات الكاشط — **مستثناة من Git** (انظر `.gitignore`) لأنها بيانات تشغيل وليست جزءاً من الكود.
+- **`data/scraper_state.db`**: حالة الكشط (pending/completed/failed) للاستئناف بعد الانقطاع.
+- **`data/final_priced_latest.csv`**: ناتج التسعير التلقائي الخلفي الجاهز للعرض في لوحة التسعير.
 
 الكشط يعمل **في بيئتكم** (جهاز أو سيرفر)؛ لا يعتمد على خوادم خارجية لاستضافة عملية الزحف نيابة عنكم.
+
+### تشغيل تلقائي على Windows (Task Scheduler)
+
+أمر سريع لإنشاء مهمة تبدأ مع الإقلاع:
+
+```powershell
+schtasks /Create /SC ONSTART /TN "KIX Background Worker" /TR "cmd /c cd /d C:\Users\Hp\Downloads\kix333 && python run_background_worker.py" /RL HIGHEST /F
+```
+
+للتحقق:
+
+```powershell
+schtasks /Query /TN "KIX Background Worker" /V /FO LIST
+```
+
+للحذف:
+
+```powershell
+schtasks /Delete /TN "KIX Background Worker" /F
+```
 
 ---
 
