@@ -279,7 +279,43 @@ def _auto_refresh_results_from_background_files() -> bool:
     - data/competitors_latest.csv (لاستخراج مفقودات إضافية)
     """
     priced_path = os.path.join(os.getcwd(), "data", "final_priced_latest.csv")
+    comp_csv = os.path.join(os.getcwd(), "data", "competitors_latest.csv")
     if not os.path.exists(priced_path):
+        # fallback: وزّع على الأقل المفقودات من ملف المنافسين حتى لا تبقى الأقسام صفراً
+        if os.path.exists(comp_csv):
+            try:
+                comp_raw = pd.read_csv(comp_csv)
+                if comp_raw.empty:
+                    return False
+                rename_map = {
+                    "الاسم": "name",
+                    "السعر": "comp_price",
+                    "الماركة": "brand",
+                    "رابط_الصورة": "comp_image_url",
+                    "رابط_المنتج": "comp_url",
+                    "المنافس": "competitor_name",
+                }
+                for ar, en in rename_map.items():
+                    if ar in comp_raw.columns and en not in comp_raw.columns:
+                        comp_raw[en] = comp_raw[ar]
+                if "name" not in comp_raw.columns:
+                    comp_raw["name"] = ""
+                if "sku" not in comp_raw.columns:
+                    comp_raw["sku"] = ""
+                comp_raw["is_missing"] = True
+                comp_raw["status"] = "missing"
+                st.session_state.results = {
+                    "price_raise": pd.DataFrame(),
+                    "price_lower": pd.DataFrame(),
+                    "approved": pd.DataFrame(),
+                    "review": pd.DataFrame(),
+                    "missing": comp_raw,
+                    "all": comp_raw,
+                }
+                st.session_state.analysis_df = comp_raw.copy()
+                return True
+            except Exception:
+                return False
         return False
     try:
         work = pd.read_csv(priced_path)
@@ -315,7 +351,6 @@ def _auto_refresh_results_from_background_files() -> bool:
         mask_approved = (~mask_missing & ~mask_processed & ~mask_review & valid_comp & (rel_diff <= 0.02))
 
         missing_df = work[mask_missing].copy()
-        comp_csv = os.path.join(os.getcwd(), "data", "competitors_latest.csv")
         if os.path.exists(comp_csv):
             comp_raw = pd.read_csv(comp_csv)
             rename_map = {"الاسم": "name", "sku": "sku"}
