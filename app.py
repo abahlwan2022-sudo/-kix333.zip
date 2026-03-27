@@ -172,6 +172,20 @@ def _first_display_image_url(img_result):
     return ""
 
 
+def _image_url_from_row(row: pd.Series, *keys: str) -> str:
+    """أول رابط صورة صالح من أعمدة الصف (ملف المنتجات أو كشط المنافسين)."""
+    for k in keys:
+        if k not in row.index:
+            continue
+        v = row.get(k)
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            continue
+        s = str(v).strip()
+        if s.startswith("http"):
+            return s
+    return ""
+
+
 def _restore_results_from_json(results_list):
     """استعادة النتائج من JSON — يحول نصوص القوائم لقوائم فعلية"""
     import json as _j
@@ -498,6 +512,10 @@ def render_pro_table(df, prefix, section_type="update", show_search=True):
             st.caption("☑️ حدد منتجات\nبالـ Checkbox أدناه")
 
     st.caption(f"عرض {len(filtered)} من {len(df)} منتج — {datetime.now().strftime('%H:%M:%S')}")
+    st.caption(
+        "🖼️ **بطاقة VS:** يسار = **منتجنا** (صورة من ملفك أو `image_url` إن وُجدت)، يمين = **لدى المنافس** "
+        "(من كشط المنافسين `comp_image_url` / `رابط_الصورة` في الدمج، أو بحث تلقائي)."
+    )
 
     # ── Pagination ─────────────────────────────
     PAGE_SIZE = 25
@@ -567,24 +585,46 @@ def render_pro_table(df, prefix, section_type="update", show_search=True):
             try: _pid_str = str(int(float(str(_pid_raw))))
             except: _pid_str = str(_pid_raw)
 
-        # ── جلب صورة المنتج مع تخزين مؤقت في session_state ──
+        # ── صور: أولوية لأعمدة الصف (ملف + كشط)، ثم بحث تلقائي ──
+        _our_from_row = _image_url_from_row(
+            row,
+            "image_url",
+            "صورة المنتج",
+            "رابط_الصورة",
+            "صورة",
+            "رابط الصورة",
+        )
+        _comp_from_row = _image_url_from_row(
+            row,
+            "comp_image_url",
+            "صورة_المنافس",
+            "رابط_صورة_المنافس",
+            "رابط صورة المنافس",
+        )
+
         _img_cache_key = f"img_{our_name}_{brand}"
-        if _img_cache_key not in st.session_state:
-            try:
-                _img_result = fetch_product_images(our_name, brand)
-                st.session_state[_img_cache_key] = _first_display_image_url(_img_result)
-            except Exception:
-                st.session_state[_img_cache_key] = ""
-        _product_image_url = st.session_state.get(_img_cache_key, "")
+        if _our_from_row:
+            _product_image_url = _our_from_row
+        else:
+            if _img_cache_key not in st.session_state:
+                try:
+                    _img_result = fetch_product_images(our_name, brand)
+                    st.session_state[_img_cache_key] = _first_display_image_url(_img_result)
+                except Exception:
+                    st.session_state[_img_cache_key] = ""
+            _product_image_url = st.session_state.get(_img_cache_key, "")
 
         _comp_img_key = f"img_comp_{comp_name}_{brand}_{comp_src}"
-        if _comp_img_key not in st.session_state:
-            try:
-                _cr = fetch_product_images(comp_name, brand)
-                st.session_state[_comp_img_key] = _first_display_image_url(_cr)
-            except Exception:
-                st.session_state[_comp_img_key] = ""
-        _comp_image_url = st.session_state.get(_comp_img_key, "")
+        if _comp_from_row:
+            _comp_image_url = _comp_from_row
+        else:
+            if _comp_img_key not in st.session_state:
+                try:
+                    _cr = fetch_product_images(comp_name, brand)
+                    st.session_state[_comp_img_key] = _first_display_image_url(_cr)
+                except Exception:
+                    st.session_state[_comp_img_key] = ""
+            _comp_image_url = st.session_state.get(_comp_img_key, "")
 
         if comp_price and comp_price > 0:
             _diff_pct_val = (our_price - comp_price) / comp_price * 100.0
@@ -1568,6 +1608,10 @@ elif page == "📂 رفع الملفات":
 # ════════════════════════════════════════════════
 elif page == "🔴 سعر أعلى":
     st.header("🔴 منتجات سعرنا أعلى — فرصة خفض")
+    st.caption(
+        "🏪 **متجرنا (مهووس):** مرجع ملف المنتجات · **المنافسون:** عالم جيفنشي، خبير العطور، سارا ميك أب "
+        "(كشط من «🏢 كشط المنافسين»). المقارنة تعرض **صورتنا VS صورة المنافس** عند توفر الروابط."
+    )
     db_log("price_raise", "view")
     if st.session_state.results and "price_raise" in st.session_state.results:
         df = st.session_state.results["price_raise"]
@@ -1602,6 +1646,9 @@ elif page == "🔴 سعر أعلى":
 # ════════════════════════════════════════════════
 elif page == "🟢 سعر أقل":
     st.header("🟢 منتجات سعرنا أقل — فرصة رفع")
+    st.caption(
+        "مقارنة أسعار **مهووس** مقابل المنافسين المكشوفين — البطاقات تعرض **صورة منتجنا** و**صورة المنافس**."
+    )
     db_log("price_lower", "view")
     if st.session_state.results and "price_lower" in st.session_state.results:
         df = st.session_state.results["price_lower"]
@@ -1635,6 +1682,7 @@ elif page == "🟢 سعر أقل":
 # ════════════════════════════════════════════════
 elif page == "✅ موافق عليها":
     st.header("✅ منتجات موافق عليها")
+    st.caption("أسعار متوازنة مع المنافس — عرض **VS** بنفس منطق الأقسام الأخرى.")
     db_log("approved", "view")
     if st.session_state.results and "approved" in st.session_state.results:
         df = st.session_state.results["approved"]
@@ -1652,6 +1700,9 @@ elif page == "✅ موافق عليها":
 # ════════════════════════════════════════════════
 elif page == "🔍 منتجات مفقودة":
     st.header("🔍 منتجات المنافسين غير الموجودة عندنا")
+    st.caption(
+        "منتجات يظهرها **المنافسون** (جيفنشي / خبير / سارا…) ولا تطابق كتالوج **مهووس** بعد."
+    )
     db_log("missing", "view")
 
     if st.session_state.results and "missing" in st.session_state.results:
@@ -2072,6 +2123,7 @@ elif page == "🔍 منتجات مفقودة":
 # ════════════════════════════════════════════════
 elif page == "⚠️ تحت المراجعة":
     st.header("⚠️ منتجات تحت المراجعة — مطابقة غير مؤكدة")
+    st.caption("راجع المطابقة بين **منتجاتنا** وعروض **المنافسين** قبل اعتماد السعر.")
     db_log("review", "view")
 
     if st.session_state.results and "review" in st.session_state.results:
@@ -2248,7 +2300,9 @@ elif page == "⚠️ تحت المراجعة":
 # ════════════════════════════════════════════════
 elif page == "✔️ تمت المعالجة":
     st.header("✔️ المنتجات المعالجة")
-    st.caption("جميع المنتجات التي تم ترحيلها أو تحديث سعرها أو إضافتها")
+    st.caption(
+        "سجل الإجراءات (إرسال لـ Make، تحديث سعر، إلخ) لمسار **مهووس** مقابل منافسيك."
+    )
     db_log("processed", "view")
 
     processed = get_processed(limit=500)
