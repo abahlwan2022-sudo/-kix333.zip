@@ -2,6 +2,8 @@ import streamlit as st
 import json
 import os
 
+from utils.sitemap_resolve import resolve_store_to_sitemap_url
+
 COMPETITORS_FILE = 'data/competitors_list.json'
 
 
@@ -28,30 +30,39 @@ def save_competitors(competitors_list):
 
 def render_competitor_management_ui():
     st.markdown("## 🏢 إدارة روابط المنافسين (Sitemaps)")
-    st.info("قم بإضافة رابط خريطة المنتجات للمنافس. مثال: [https://store.com/sitemap_products.xml](https://store.com/sitemap_products.xml)")
+    st.info(
+        "أدخل **رابط المتجر** (مثل `https://mahwous.com/`) أو **رابط Sitemap مباشر**. "
+        "التطبيق يستنتج تلقائياً ملف الـ sitemap الصحيح من `robots.txt` أو المسارات الشائعة."
+    )
 
     competitors = load_competitors()
 
     with st.form("add_competitor_form", clear_on_submit=True):
         col1, col2 = st.columns([3, 1])
         with col1:
-            new_url = st.text_input("رابط Sitemap:", placeholder="https://...")
+            new_url = st.text_input(
+                "رابط المتجر أو Sitemap:",
+                placeholder="https://example.com/",
+            )
         with col2:
             st.write("")
             st.write("")
             submitted = st.form_submit_button("➕ إضافة", use_container_width=True)
 
         if submitted:
-            if new_url and new_url.startswith("http") and "xml" in new_url:
-                if new_url not in competitors:
-                    competitors.append(new_url.strip())
-                    save_competitors(competitors)
-                    st.success("تمت الإضافة بنجاح!")
-                    st.rerun()
-                else:
-                    st.warning("هذا الرابط مضاف مسبقاً.")
+            if not (new_url and new_url.strip()):
+                st.error("الرجاء إدخال رابط.")
             else:
-                st.error("الرجاء إدخال رابط Sitemap صحيح يبدأ بـ http وينتهي بـ xml")
+                resolved, msg = resolve_store_to_sitemap_url(new_url.strip())
+                if not resolved:
+                    st.error(msg)
+                elif resolved in competitors:
+                    st.warning("هذا الرابط (مُسنّداً) مضاف مسبقاً.")
+                else:
+                    competitors.append(resolved)
+                    save_competitors(competitors)
+                    st.success(f"تمت الإضافة بنجاح! {msg}")
+                    st.rerun()
 
     st.markdown(f"### 📋 قائمة المنافسين الحاليين ({len(competitors)})")
     if not competitors:
