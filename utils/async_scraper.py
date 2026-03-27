@@ -151,9 +151,13 @@ class AsyncCompetitorScraper:
 
     async def scan_sitemap(
         self, session: aiohttp.ClientSession, sitemap_url: str
-    ) -> List[str]:
-        """يجلب sitemap أو sitemapindex (يتفرع بشكل متكرر لكل sub-sitemap)."""
+    ) -> tuple[List[str], Dict[str, Any]]:
+        """يجلب sitemap أو sitemapindex (يتفرع بشكل متكرر لكل sub-sitemap).
+
+        يعيد (الروابط، تشخيصاً لآخر طلب مباشر على هذا الرابط أو للفهرس الفرعي).
+        """
         collected: List[str] = []
+        diag: Dict[str, Any] = {"http_status": None, "fetch_error": None, "parse_error": None}
         ref = self._referer_for_url(sitemap_url)
         try:
             async with session.get(
@@ -161,19 +165,22 @@ class AsyncCompetitorScraper:
                 timeout=aiohttp.ClientTimeout(total=180),
                 headers=self._get_headers(referer=ref),
             ) as resp:
+                diag["http_status"] = resp.status
                 if resp.status != 200:
                     logger.warning("Sitemap HTTP %s for %s", resp.status, sitemap_url)
-                    return []
+                    return [], diag
                 text = await resp.text()
         except Exception as e:
             logger.error("Sitemap fetch failed %s: %s", sitemap_url, e)
-            return []
+            diag["fetch_error"] = str(e)
+            return [], diag
 
         try:
             root = ET.fromstring(text)
         except ET.ParseError as e:
             logger.error("Sitemap XML parse error %s: %s", sitemap_url, e)
-            return []
+            diag["parse_error"] = str(e)
+            return [], diag
 
         root_local = _tag_local(root.tag)
         if root_local == "sitemapindex":
@@ -184,9 +191,9 @@ class AsyncCompetitorScraper:
                     if u.startswith("http"):
                         child_locs.append(u)
             for child in child_locs:
-                sub = await self.scan_sitemap(session, child)
+                sub, _ = await self.scan_sitemap(session, child)
                 collected.extend(sub)
-            return list(dict.fromkeys(collected))
+            return list(dict.fromkeys(collected)), diag
 
         if root_local == "urlset":
             for el in root.iter():
@@ -194,14 +201,14 @@ class AsyncCompetitorScraper:
                     u = el.text.strip()
                     if u.startswith("http"):
                         collected.append(u)
-            return list(dict.fromkeys(collected))
+            return list(dict.fromkeys(collected)), diag
 
         for el in root.iter():
             if _tag_local(el.tag) == "loc" and el.text:
                 u = el.text.strip()
                 if u.startswith("http"):
                     collected.append(u)
-        return list(dict.fromkeys(collected))
+        return list(dict.fromkeys(collected)), diag
 
     def _extract_from_json(self, data: dict, url: str) -> Optional[Dict[str, Any]]:
         """يستخرج حقولاً من كائن Product / ProductGroup (Salla وغيرها)."""
@@ -379,6 +386,7 @@ async def run_scraper_engine() -> None:
                 "fetch_exceptions": 0,
                 "parse_null": 0,
                 "success_rate_pct": 0.0,
+                "sitemap_diagnostics": [],
             }
         )
         return
@@ -388,10 +396,20 @@ async def run_scraper_engine() -> None:
     urls_queued = 0
     fetch_exceptions = 0
     parse_null = 0
+    sitemap_diagnostics: List[Dict[str, Any]] = []
 
     async with aiohttp.ClientSession() as session:
         for sitemap in competitor_sitemaps:
-            urls = await scraper.scan_sitemap(session, sitemap)
+            urls, diag = await scraper.scan_sitemap(session, sitemap)
+            sitemap_diagnostics.append(
+                {
+                    "sitemap": sitemap,
+                    "urls_found": len(urls),
+                    "http_status": diag.get("http_status"),
+                    "fetch_error": diag.get("fetch_error"),
+                    "parse_error": diag.get("parse_error"),
+                }
+            )
             if not urls:
                 continue
 
@@ -445,6 +463,7 @@ async def run_scraper_engine() -> None:
                 "fetch_exceptions": fetch_exceptions,
                 "parse_null": parse_null,
                 "success_rate_pct": success_rate,
+                "sitemap_diagnostics": sitemap_diagnostics,
             }
         )
     else:
@@ -460,6 +479,7 @@ async def run_scraper_engine() -> None:
                 "fetch_exceptions": fetch_exceptions,
                 "parse_null": parse_null,
                 "success_rate_pct": 0.0,
+                "sitemap_diagnostics": sitemap_diagnostics,
             }
         )
 
