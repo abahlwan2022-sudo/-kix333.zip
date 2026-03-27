@@ -10,6 +10,7 @@ Features:
 from __future__ import annotations
 
 import asyncio
+import ast
 import hashlib
 import json
 import logging
@@ -137,6 +138,22 @@ def _load_competitor_sitemaps() -> List[Dict[str, str]]:
                         out.append({"name": name, "domain": domain})
                 elif isinstance(item, str):
                     u = item.strip()
+                    # دعم حالات legacy التي خزّنت dict كنص
+                    if u.startswith("{") and "domain" in u:
+                        parsed = None
+                        try:
+                            parsed = json.loads(u)
+                        except Exception:
+                            try:
+                                parsed = ast.literal_eval(u)
+                            except Exception:
+                                parsed = None
+                        if isinstance(parsed, dict):
+                            d = str(parsed.get("domain", "")).strip()
+                            n = str(parsed.get("name", "")).strip() or d
+                            if d and not is_main_store_domain(d):
+                                out.append({"name": n, "domain": d})
+                            continue
                     if u and not is_main_store_domain(u):
                         out.append({"name": u, "domain": u})
             return out
